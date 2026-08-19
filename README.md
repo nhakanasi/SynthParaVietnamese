@@ -26,24 +26,43 @@ Transcript ──► Qwen/Gemini (insert one [tag]) ──► tagged transcript 
 
 ## Install
 
+One command does the whole setup — dependencies, Seed-VC, model weights, VocalSound, and
+the `.gitignore`/`.env` scaffolding:
+
 ```bash
-pip install -e .
-# plus whichever optional extras you need:
-pip install -e ".[qwen3,tagging-qwen,audio-extra,mms]"
+./scripts/prepare.sh
 ```
 
-Then, one-time setup (each is idempotent — safe to re-run):
+Requires Python ≥ 3.10 and downloads ~6.5GB. Every step is idempotent and independently
+skippable, so it's safe to re-run after a partial or failed setup:
 
 ```bash
-./scripts/download_vocalsound.sh       # ~2.9GB, VocalSound audio (offline, no Python needed)
+./scripts/prepare.sh --venv            # create and use ./.venv
+./scripts/prepare.sh --with-mfa        # also bootstrap Montreal Forced Aligner (slow)
+./scripts/prepare.sh --skip-dataset    # skip the ~2.9GB VocalSound download
+./scripts/prepare.sh --help            # all flags
+```
+
+<details>
+<summary>Or run the steps individually</summary>
+
+```bash
+pip install -e ".[qwen3,tagging-qwen,audio-extra,mms]"
+./scripts/download_vocalsound.sh       # ~2.9GB, VocalSound audio
 ./scripts/download_qwen3_models.sh     # ~3.6GB, Qwen3-ASR-0.6B + Qwen3-ForcedAligner-0.6B
 para-synth setup-seedvc                # git clone + pip install seed-vc
 para-synth setup-mfa                   # optional — qwen3 is tried first in the align chain
 para-synth doctor                      # checks for the dependency landmines in docs/PIPELINE.md
 ```
 
-Copy `.env.example` to `.env` and fill in `DASHSCOPE_API_KEY` or `GEMINI_API_KEY` (whichever
-`configs/default.yaml: tagging.backend` is set to) before running `tag-transcripts`.
+Install order matters: Seed-VC's `requirements.txt` pins `numpy<2` and an older
+`transformers`, and pip resolves last-write-wins, so install it *after* this package.
+`prepare.sh` already does that.
+</details>
+
+`prepare.sh` creates `.env` from `.env.example` if it's missing — fill in
+`DASHSCOPE_API_KEY` or `GEMINI_API_KEY` (whichever `configs/default.yaml: tagging.backend`
+needs) before running `tag-transcripts`.
 
 GPU is optional but strongly recommended — Seed-VC, Qwen3-ASR/ForcedAligner, and the WavLM
 speaker-similarity check are all much faster on one. MFA's alignment (if you enable it) runs
@@ -105,6 +124,7 @@ para_synth/            installable package — see docs/PIPELINE.md for what eac
 configs/default.yaml     all tunables
 docs/                    PIPELINE.md (deep-dive) + synthesis.drawio.png (diagram)
 reference/               original Kaggle notebook, kept for provenance
+scripts/prepare.sh       one-shot environment setup (deps, models, dataset, gitignore)
 scripts/                 offline-download and example-run shell scripts
 third_party/             gitignored: cloned seed-vc, downloaded model weights (see
                           third_party/models/README.md for the purpose-based layout)

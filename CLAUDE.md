@@ -16,22 +16,34 @@ from — most modules are near-verbatim ports of specific cells; `docs/PIPELINE.
 cell→module table. When in doubt about *why* a piece of DSP/alignment code does something
 non-obvious, check the corresponding notebook cell's markdown before assuming it's arbitrary.
 
-## Current state (as of this repo's creation)
+## Setting up
 
-- ✅ `data/vocalsound/audio_16k/` — downloaded (Zenodo mirror; see `vocalsound.py` for why
-  not the official Dropbox link).
-- ✅ `third_party/models/asr/qwen3-asr-0.6b/`, `third_party/models/aligner/qwen3-forcedaligner-0.6b/` — downloaded.
-- ✅ `third_party/seed-vc/` — cloned, **not** `pip install -r requirements.txt`'d yet (run
-  `para-synth setup-seedvc` or do it manually before the first real `para-synth run`).
-- ⬜ MFA — not bootstrapped (`para-synth setup-mfa`); not required, since `align/qwen3.py` is
-  tried first in the alignment chain and doesn't need it.
-- ⬜ No `DASHSCOPE_API_KEY`/`GEMINI_API_KEY` configured — `tagging.py` (the LLM tag-insertion
-  step) has not been executed or tested. Copy `.env.example` to `.env` before using it.
-- ⬜ `data/raw/audio/` and `data/raw/transcripts/` are empty — no actual speech recordings
-  are checked into this repo. Populate those before running anything past `setup-*`.
-- ⬜ Nothing in `para_synth/` has been run end-to-end (no GPU / API keys available when this
-  repo was built) — modules were written carefully against the notebook's working reference
-  implementation, but treat a first real run as the first real test.
+`./scripts/prepare.sh` does the whole environment setup in one go (deps, Seed-VC, Qwen3
+weights, VocalSound, `.gitignore`/`.env`). Idempotent and independently skippable per step
+— prefer it over running the individual `scripts/download_*.sh` / `para-synth setup-*`
+commands, and prefer *fixing* it over working around it if setup breaks.
+
+## Current state (as of this repo's creation, on the machine it was built on)
+
+The repo was scaffolded on a machine with **Python 3.9 and no GPU**, while the pipeline
+targets Python ≥3.10 with a GPU — so most of it has never executed. Specifically:
+
+- ⚠️ **Nothing in `para_synth/` has been run end-to-end.** Modules were written against the
+  notebook's working reference implementation and unit-checked where possible (config
+  loading, manifest pairing, tag regex/matching, the DSP splice/silence functions, the
+  tagging validator, RNG independence), but treat the first real run as the first real test.
+- ⚠️ No LLM API call has ever been made — `tagging.py`'s request shapes (both the text
+  backends and `qwen_omni_audio`) are built from documented formats, unverified live.
+  Expect small adjustments on first contact.
+- 🟡 `data/vocalsound/audio_16k/` — **partial** (~458 of 21,024 clips). The download was
+  interrupted; re-run `./scripts/download_vocalsound.sh`, which resumes.
+- ✅ `third_party/models/asr/qwen3-asr-0.6b/` and `.../aligner/qwen3-forcedaligner-0.6b/`
+  — fully downloaded.
+- 🟡 `third_party/seed-vc/` — cloned but its `requirements.txt` was never installed.
+- ⬜ MFA not bootstrapped. Optional: `align/qwen3.py` is tried first and needs no conda.
+- ⬜ No `DASHSCOPE_API_KEY`/`GEMINI_API_KEY` set.
+- ⬜ `data/raw/audio/` and `data/raw/transcripts/` are empty — no speech recordings ship
+  with this repo. Populate them before running anything past setup.
 
 ## Module map (see docs/PIPELINE.md for the full diagram mapping)
 
