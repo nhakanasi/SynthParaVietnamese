@@ -165,3 +165,32 @@ to begin with.
 
 See `third_party/models/README.md` — weights are organized by pipeline purpose (asr,
 aligner, conversion, speaker-id, splicing), not by vendor.
+
+## Deliberately not implemented
+
+A few DSP/selection ideas were considered and rejected — noted here so they don't get
+re-proposed or "fixed in" without re-litigating the reasoning:
+
+- **Mel-spectrogram + neural-vocoder (HiFi-GAN) resynthesis of the stitched waveform** at
+  the splice step — see "Splicing: fixed vs. adaptive" above. Regenerates the entire
+  recording's phase, not just the two junctions; works against the goal of leaving the
+  speaker's real audio untouched outside the inserted event.
+- **Time-stretching the VocalSound clip to match the speaker's speech tempo** — cough,
+  sneeze, throat-clearing, and sniff are reflexive/mechanical events whose duration is set
+  by airway mechanics, not speaking rate, so there's no real perceptual link to stretch
+  toward. They're also broadband/transient/noise-like, and phase-vocoder/WSOLA time-stretch
+  algorithms (built for quasi-periodic content) tend to smear or add metallic artifacts on
+  that kind of signal. If a class's duration ever needs adjusting, `seedvc.length_adjust`
+  (already wired through `run_seedvc()`) lets Seed-VC's own conversion generate a
+  naturally longer/shorter take instead of stretching a fixed recording after the fact.
+- **Selecting a VocalSound clip to match the target speaker's inferred vocal
+  energy/register** (e.g. avoid pairing a big laugh with a soft-spoken voice) — a real
+  person's laugh/cough doesn't reliably scale with how loud or soft they speak, so
+  filtering on that basis would just encode a stereotype and shrink exactly the acoustic
+  variance a downstream Para-TTS model benefits from seeing. `pick_vocalsound_clip()`
+  stays pure-random on purpose. If the "sounds unnatural" complaint recurs, the fix is at
+  the loudness/duration layer (`splice.para_gain_db`, `seedvc.length_adjust`), not
+  clip selection — and if under/over-representation of an event's intensity range within
+  VocalSound itself ever becomes an issue, the principled fix is intensity-stratified
+  sampling *within* a class (uniform across loud/soft), not similarity-matching to the
+  speaker.
