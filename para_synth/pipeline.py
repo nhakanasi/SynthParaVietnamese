@@ -201,7 +201,7 @@ def synthesize_row(
     insert_at_s: float,
     insert_stage: str,
 ) -> SynthesisResult:
-    rng = cfg.rng()
+    rng = cfg.rng(row.id)  # per-row keys — see Config.rng(); a bare rng() repeats per row
     nv_tag = extract_tag(row.text)
     if nv_tag is None:
         raise ValueError(f"row {row.id!r} has no [tag] in its transcript — run tagging first")

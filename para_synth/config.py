@@ -5,6 +5,7 @@ threaded through every function instead of relied on as ambient state.
 """
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -133,8 +134,22 @@ class Config:
     tagging: TaggingConfig
     sample_rate: int = 22050
 
-    def rng(self) -> random.Random:
-        return random.Random(self.seed)
+    def rng(self, *keys) -> random.Random:
+        """A random generator seeded from the base seed mixed with `keys`.
+
+        ALWAYS pass keys that identify what you're drawing for (e.g. a row id, a variant
+        index). A bare `Config.rng()` returns the *same* sequence every call, so calling it
+        per-row hands every row identical draws — which silently made every row of a given
+        tag class pick the exact same VocalSound clip before this took keys. Mixing the
+        keys in keeps runs reproducible (same seed -> same dataset) while making different
+        rows and variants genuinely independent.
+        """
+        if self.seed is None:
+            return random.Random()  # explicitly non-reproducible: fresh entropy per call
+        if not keys:
+            return random.Random(self.seed)
+        digest = hashlib.sha256("\x00".join(str(k) for k in keys).encode("utf-8")).hexdigest()
+        return random.Random(self.seed ^ int(digest[:16], 16))
 
     def ensure_dirs(self) -> None:
         for d in (self.paths.work_dir, self.paths.output_dir):
