@@ -183,14 +183,44 @@ re-proposed or "fixed in" without re-litigating the reasoning:
   that kind of signal. If a class's duration ever needs adjusting, `seedvc.length_adjust`
   (already wired through `run_seedvc()`) lets Seed-VC's own conversion generate a
   naturally longer/shorter take instead of stretching a fixed recording after the fact.
-- **Selecting a VocalSound clip to match the target speaker's inferred vocal
-  energy/register** (e.g. avoid pairing a big laugh with a soft-spoken voice) — a real
-  person's laugh/cough doesn't reliably scale with how loud or soft they speak, so
-  filtering on that basis would just encode a stereotype and shrink exactly the acoustic
-  variance a downstream Para-TTS model benefits from seeing. `pick_vocalsound_clip()`
-  stays pure-random on purpose. If the "sounds unnatural" complaint recurs, the fix is at
-  the loudness/duration layer (`splice.para_gain_db`, `seedvc.length_adjust`), not
-  clip selection — and if under/over-representation of an event's intensity range within
-  VocalSound itself ever becomes an issue, the principled fix is intensity-stratified
-  sampling *within* a class (uniform across loud/soft), not similarity-matching to the
-  speaker.
+- **Hard-filtering VocalSound clips by the speaker's vocal register** (e.g. a soft-spoken
+  speaker may *only* receive soft laughs) — a real person's laugh/cough doesn't reliably
+  scale with how loud or soft they speak, so a hard filter encodes a stereotype that's
+  often false and deletes exactly the acoustic variance a downstream Para-TTS model
+  benefits from seeing. The *soft* version of this idea is implemented instead — see
+  "Clip selection" below.
+
+## Clip selection: energy-weighted, not filtered
+
+`pick_vocalsound_clip()` (`pipeline.py`) biases — never restricts — which clip a row gets.
+With `selection.energy_weight: 0` it's uniform random over the matched class. Above zero,
+it loads a random candidate subset, ranks each candidate's intensity within that subset,
+and samples with weight `exp(-energy_weight * |clip_rank - speaker_score|)`. Closer
+matches get more probability; every usable candidate keeps nonzero probability, so a big
+laugh from a soft-spoken speaker still occurs — just less often than uniform sampling
+would produce it.
+
+Both sides of that comparison are **relative, self-calibrating measures**, which matters:
+
+- `clip_features()` returns raw crest factor and duration, *not* absolute loudness —
+  clips get peak-normalised by `_finalize_clip()` and re-levelled by `splice()` anyway, so
+  raw amplitude only tells you about VocalSound's crowdsourced recording gain. Those raw
+  features are converted to percentile ranks *within the candidate pool*.
+- `speaker_energy_score()` is the percentile rank of the pre-splice window's RMS among all
+  same-length windows in that utterance — i.e. "is this a loud or quiet moment *for this
+  speaker*", which is invariant to mic and recording gain.
+
+The percentile framing is load-bearing, not stylistic. An earlier version of this used
+fixed reference constants (crest ÷ 0.5, duration ÷ 2s) and was badly miscalibrated against
+real VocalSound audio: measured crest factors cluster near 0.11 and the median clip runs
+~2.7s, saturating the duration term, so nearly every clip scored ~0.58 and weighting had
+no signal to act on — measured mean picked intensity was identical (0.568 vs 0.563) for
+soft vs. loud speakers. With percentile ranks the same test tracks the speaker properly
+(0.41 / 0.48 / 0.58 mean rank for speaker scores 0.15 / 0.50 / 0.85) while picks still
+span nearly the full intensity range. If you change these features, re-run that check
+rather than assuming a new proxy has usable spread.
+
+Note that `splice.para_gain_db` and `seedvc.length_adjust` are *not* substitutes here:
+gain only rescales the mix level and Seed-VC converts timbre, so neither turns an
+acoustically boisterous laugh into a gentle one. Selection is the layer where that
+distinction is actually made.

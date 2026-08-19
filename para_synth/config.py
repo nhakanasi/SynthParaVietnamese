@@ -39,6 +39,24 @@ class SpliceConfig:
 
 
 @dataclass
+class SelectionConfig:
+    """How pick_vocalsound_clip() chooses which VocalSound clip to use for a row.
+
+    `energy_weight` = 0.0 is pure-random (every clip in the class equally likely). Higher
+    values bias sampling toward clips whose loudness is closer to the target speaker's own
+    recent level — a *soft* preference, never a hard filter: every clip keeps nonzero
+    probability, so genuinely loud-laugh-from-a-soft-speaker pairings still occur, just
+    less often than jarringly-mismatched ones otherwise would. See docs/PIPELINE.md.
+    """
+
+    energy_weight: float = 0.0
+    # Seconds of speech immediately before the splice point used as the speaker's
+    # reference level — local context, not the whole utterance, since a speaker's energy
+    # varies across a recording and what matters is the moment the event interrupts.
+    context_s: float = 2.5
+
+
+@dataclass
 class AlignmentConfig:
     use_qwen3: bool = True
     use_mfa: bool = True
@@ -107,6 +125,7 @@ class Config:
     seed: Optional[int]
     seedvc: SeedVCConfig
     splice: SpliceConfig
+    selection: SelectionConfig
     alignment: AlignmentConfig
     models: ModelsConfig
     asr: ASRConfig
@@ -143,6 +162,7 @@ def load_config(path: str | Path = REPO_ROOT / "configs/default.yaml") -> Config
             f0_condition=raw["seedvc"]["f0_condition"],
         ),
         splice=SpliceConfig(**raw["splice"]),
+        selection=SelectionConfig(**raw.get("selection", {})),
         alignment=AlignmentConfig(
             use_qwen3=raw["alignment"].get("use_qwen3", True),
             use_mfa=raw["alignment"]["use_mfa"],

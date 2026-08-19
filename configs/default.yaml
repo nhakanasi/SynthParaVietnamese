@@ -25,6 +25,16 @@ splice:
   min_pad_ms: 10 # adaptive_splice() bridge width at a boundary that was already quiet
   max_gap_ms: 70 # adaptive_splice() bridge width at a boundary that needed damping
 
+selection:
+  # How pick_vocalsound_clip() chooses a clip within the matched VocalSound class.
+  # 0.0 = pure random (every clip equally likely). Higher values bias sampling toward
+  # clips whose loudness is closer to the speaker's own level just before the splice
+  # point — a soft preference, never a hard filter, so a loud laugh from a soft-spoken
+  # speaker still happens sometimes (real people do that) and the dataset keeps the
+  # acoustic variance a Para-TTS model benefits from. ~1.0-2.0 is a moderate bias.
+  energy_weight: 1.0
+  context_s: 2.5 # seconds of speech before the splice point used as the reference level
+
 sample_rate: 22050 # Seed-VC's base vocoder rate; everything is resampled to this
 
 alignment:
