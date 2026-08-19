@@ -15,7 +15,7 @@ import numpy as np
 import soundfile as sf
 
 from para_synth.align import AlignmentPipeline
-from para_synth.audio_utils import load_mono, splice, trim_event
+from para_synth.audio_utils import adaptive_splice, load_mono, splice, trim_event
 from para_synth.config import Config
 from para_synth.dataset import ManifestRow, extract_tag
 from para_synth.quality import SpeakerSimilarity
@@ -86,11 +86,18 @@ def synthesize_row(
         print(f"   ⚠️  {row.id}: conversion didn't clearly beat the raw-clip baseline "
               f"({sim_converted:.3f} <= {sim_raw_baseline:.3f})")
 
-    final, at = splice(
-        speech_arr, conv_arr, cfg.sample_rate,
-        cfg.splice.placement, cfg.splice.para_gain_db, cfg.splice.pad_ms, cfg.splice.fade_ms,
-        at_s=insert_at_s,
-    )
+    if cfg.splice.adaptive:
+        final, at = adaptive_splice(
+            speech_arr, conv_arr, cfg.sample_rate, cfg.splice.para_gain_db,
+            cfg.splice.min_pad_ms, cfg.splice.max_gap_ms, cfg.splice.fade_ms,
+            at_s=insert_at_s,
+        )
+    else:
+        final, at = splice(
+            speech_arr, conv_arr, cfg.sample_rate,
+            cfg.splice.placement, cfg.splice.para_gain_db, cfg.splice.pad_ms, cfg.splice.fade_ms,
+            at_s=insert_at_s,
+        )
     final = final / (np.max(np.abs(final)) + 1e-9) * 0.95
 
     para_path = cfg.paths.output_dir / f"para_{row.id}.wav"

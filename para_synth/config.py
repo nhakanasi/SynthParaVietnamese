@@ -30,6 +30,12 @@ class SpliceConfig:
     para_gain_db: float = -3.0
     pad_ms: int = 10
     fade_ms: int = 50
+    # adaptive_splice() (para_synth.audio_utils) instead of splice(): inspects each
+    # junction's boundary RMS and only fades/widens the gap where the cut actually lands
+    # on active phonation, instead of always applying a fixed fade+pad. See audio_utils.py.
+    adaptive: bool = False
+    min_pad_ms: int = 10  # bridge width at a boundary that was already quiet
+    max_gap_ms: int = 70  # bridge width at a boundary that needed damping
 
 
 @dataclass

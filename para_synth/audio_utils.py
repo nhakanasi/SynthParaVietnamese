@@ -134,3 +134,104 @@ def splice(speech, insert, sr, placement, gain_db, pad_ms, fade_ms, at_s=None):
     cut = max(0, min(cut, len(speech)))
     out = np.concatenate([speech[:cut], blk, speech[cut:]])
     return out, cut / sr
+
+
+def rms(x) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    return float(np.sqrt(np.mean(x**2))) if len(x) else 0.0
+
+
+def cosine_fade_out(x, n: int):
+    """Raised-cosine fade-out on the last `n` samples. Smoother roll-off than a linear
+    ramp — a linear fade's slope changes abruptly at both ends, which can still leave an
+    audible tick; the cosine curve's derivative goes to zero at the edges instead."""
+    n = min(n, len(x))
+    if n < 2:
+        return x
+    y = x.copy()
+    curve = 0.5 * (1.0 + np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+    y[-n:] = y[-n:] * curve
+    return y
+
+
+def cosine_fade_in(x, n: int):
+    n = min(n, len(x))
+    if n < 2:
+        return x
+    y = x.copy()
+    curve = 0.5 * (1.0 - np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+    y[:n] = y[:n] * curve
+    return y
+
+
+def boundary_is_active(edge, overall_rms: float, ratio: float = 0.2) -> bool:
+    """True if a short slice at a cut point still carries active phonation relative to
+    its segment's own overall level — i.e. the cut lands mid-sound (a continuant, or a
+    word forced-alignment placed right up against without a real pause) rather than in a
+    natural quiet moment, and so needs damping / a gap rather than a bare concatenation."""
+    if overall_rms <= 0:
+        return False
+    return rms(edge) > ratio * overall_rms
+
+
+def matched_room_tone(n: int, reference, amplitude_ratio: float = 0.05):
+    """A short low-level noise bridge whose amplitude tracks `reference`'s own RMS,
+    instead of true digital silence — a hard zero-silence gap between two segments that
+    both have real background noise reads as an artificial mute, especially on
+    headphones. `reference` should be a quiet-ish slice near the boundary, not a loud one."""
+    if n <= 0:
+        return np.zeros(0, dtype=np.float32)
+    amp = max(rms(reference) * amplitude_ratio, 1e-5)
+    return np.random.normal(0, amp, n).astype(np.float32)
+
+
+def adaptive_splice(speech, insert, sr, gain_db, min_pad_ms, max_gap_ms, fade_ms, at_s):
+    """Two-junction splice (speech[:cut] -> insert -> speech[cut:]) that inspects each
+    junction's boundary RMS before deciding what to do with it, instead of always paying a
+    fixed fade+pad cost regardless of where the cut actually fell:
+
+    - If a boundary is quiet already (`boundary_is_active` is False), it gets only a small
+      `min_pad_ms` room-tone bridge — no fade needed, nothing was cut off.
+    - If a boundary is "active" (real phonation right at the cut — common here since the
+      cut point comes from forced alignment, not a silence heuristic, so it can land on a
+      continuant), the adjacent segment gets a cosine fade at that edge, and the bridge
+      widens to `max_gap_ms` so the damped tail has room to actually decay before the next
+      sound starts.
+
+    Same return contract as `splice()`: (waveform, cut_time_s).
+    """
+    fade_len = int(fade_ms / 1000 * sr)
+    min_pad = int(min_pad_ms / 1000 * sr)
+    max_gap = int(max_gap_ms / 1000 * sr)
+
+    if at_s is None:
+        raise ValueError("adaptive_splice requires at_s — an alignment estimate, not a placement heuristic")
+    cut = max(0, min(int(at_s * sr), len(speech)))
+    speech_before, speech_after = speech[:cut], speech[cut:]
+
+    ins = insert.copy()
+    tgt = np.max(np.abs(speech)) * (10 ** (gain_db / 20))
+    ins = ins / (np.max(np.abs(ins)) + 1e-9) * tgt
+
+    rms_before = rms(speech_before)
+    rms_after = rms(speech_after)
+    rms_ins = rms(ins)
+
+    # Junction 1: end of speech_before <-> start of insert
+    before_active = boundary_is_active(speech_before[-fade_len:], rms_before)
+    if before_active:
+        speech_before = cosine_fade_out(speech_before, fade_len)
+    if boundary_is_active(ins[:fade_len], rms_ins):
+        ins = cosine_fade_in(ins, fade_len)
+    gap1 = matched_room_tone(max_gap if before_active else min_pad, speech_before[-fade_len:])
+
+    # Junction 2: end of insert <-> start of speech_after
+    ins_tail_active = boundary_is_active(ins[-fade_len:], rms_ins)
+    if ins_tail_active:
+        ins = cosine_fade_out(ins, fade_len)
+    if boundary_is_active(speech_after[:fade_len], rms_after):
+        speech_after = cosine_fade_in(speech_after, fade_len)
+    gap2 = matched_room_tone(max_gap if ins_tail_active else min_pad, ins[-fade_len:])
+
+    out = np.concatenate([speech_before, gap1, ins, gap2, speech_after])
+    return out, cut / sr

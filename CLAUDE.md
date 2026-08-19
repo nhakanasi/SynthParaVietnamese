@@ -40,9 +40,12 @@ non-obvious, check the corresponding notebook cell's markdown before assuming it
   "simplify" these without checking the notebook cell's markdown first; several odd-looking
   lines (numpy/scipy avoidance, `USE_TF=0`, the `spn` OOV rejection, mtime-based output
   detection) are workarounds for specific real bugs, not accidental complexity.
-- `para_synth/tagging.py`, `para_synth/asr.py`, `para_synth/align/qwen3.py` — genuinely new
-  code (not in the source notebook). These implement diagram nodes the notebook didn't cover;
-  no notebook cell to check them against, so double-check them more carefully than the ports.
+- `para_synth/tagging.py`, `para_synth/asr.py`, `para_synth/align/qwen3.py`,
+  `audio_utils.py: adaptive_splice()` — genuinely new code (not in the source notebook).
+  These implement diagram nodes (or, for `adaptive_splice()`, a refinement) the notebook
+  didn't cover; no notebook cell to check them against, so double-check them more carefully
+  than the ports. `adaptive_splice()` is opt-in (`splice.adaptive: true`) — `splice()` stays
+  the tested default.
 - `para_synth/pipeline.py`, `dataset.py`, `vocalsound.py`, `cli.py` — new integration code
   gluing the above together around a local `data/raw/audio` + `data/raw/transcripts` layout
   instead of the notebook's Kaggle-mount sniffing.

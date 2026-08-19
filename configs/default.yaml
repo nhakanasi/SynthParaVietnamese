@@ -15,9 +15,15 @@ splice:
   placement: gap # legacy fallback if alignment (MFA/MMS) AND the proportional fallback
   # both come back empty: "gap" (longest pause) | "before" | "after"
   para_gain_db: -3.0 # level of the vocalisation vs. speech peak
-  pad_ms: 10 # silence either side of the insert — kept small: the cut point is a real
-  # mid-sentence word boundary, not a natural pause, so a big gap reads as a jump-cut
+  pad_ms: 10 # splice() only: fixed silence either side of the insert, always applied
   fade_ms: 50 # fade in/out on the insert at the splice point
+  # adaptive_splice() (para_synth.audio_utils) instead of splice(): only fades/widens a
+  # junction's gap when its boundary RMS shows the cut actually landed on active
+  # phonation (a real risk here — the cut point is a forced-aligned word boundary, not a
+  # natural pause) rather than always paying a fixed fade+pad cost regardless.
+  adaptive: false
+  min_pad_ms: 10 # adaptive_splice() bridge width at a boundary that was already quiet
+  max_gap_ms: 70 # adaptive_splice() bridge width at a boundary that needed damping
 
 sample_rate: 22050 # Seed-VC's base vocoder rate; everything is resampled to this
 

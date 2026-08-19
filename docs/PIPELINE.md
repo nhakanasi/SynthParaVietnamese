@@ -50,6 +50,35 @@ piece; this table is just the map from cell to module:
 | *not in the notebook* — the diagram's Qwen/Gemini tagging box | `tagging.py` — new code; the notebook's own cell 11 markdown says tagging happened upstream of it |
 | *not in the notebook* — audio-only input | `asr.py` — new code, Qwen3-ASR |
 | *not in the notebook* — Qwen3-ForcedAligner | `align/qwen3.py` — new code, added as the preferred alignment stage |
+| *not in the notebook* — adaptive splice boundary conditioning | `audio_utils.py: adaptive_splice()` — new code, opt-in via `splice.adaptive` |
+
+## Splicing: fixed vs. adaptive
+
+`splice()` (the notebook's original, still the default) always applies the same fixed
+`fade_ms` envelope to the insert and the same fixed `pad_ms` silence on both sides,
+regardless of what's actually at the cut point. Since the cut point comes from forced
+alignment rather than a silence heuristic, it can land on active phonation (a continuant
+running right up to the next word) rather than a natural pause — a fixed small pad doesn't
+guarantee a clean edge there.
+
+`adaptive_splice()` (`splice.adaptive: true` in config) inspects each of the *two* junctions
+(speech→insert, insert→speech) independently: it measures the boundary's RMS against that
+segment's own overall level (`boundary_is_active()`), and only pays for a cosine fade +
+a wider `max_gap_ms` bridge where the boundary actually needs it — an already-quiet boundary
+gets the same small `min_pad_ms` room-tone bridge `splice()` would apply everywhere. The
+bridge itself is low-level matched noise (`matched_room_tone()`), not true digital silence,
+since a hard zero between two segments that both have real background noise reads as an
+artificial mute. Verified against synthetic quiet-boundary and active-boundary cases (see
+git history) — a quiet cut gets the minimal bridge, an active cut gets the full damped
+bridge.
+
+Deliberately *not* implemented: full mel-spectrogram + neural-vocoder (e.g. HiFi-GAN)
+resynthesis of the stitched waveform. That approach regenerates the *entire* recording's
+phase through a vocoder, not just the two junctions — this pipeline's whole purpose is
+augmenting real recordings with a real re-voiced event while leaving the rest of the speaker's
+audio untouched, so full resynthesis works against that goal (timbre/naturalness drift across
+audio that should stay byte-for-byte original) for a problem the two-junction adaptive fade
+already solves without an extra model dependency.
 
 ## Alignment stage order
 
