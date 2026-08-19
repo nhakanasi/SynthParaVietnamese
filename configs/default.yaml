@@ -1,0 +1,73 @@
+# Default pipeline configuration. Mirrors notebook45ee5319ae.ipynb cell 6 verbatim —
+# see docs/PIPELINE.md for what each field does and why its default is what it is.
+
+seed: 0 # null -> different random pick every run
+
+seedvc:
+  repo_dir: third_party/seed-vc # git clone https://github.com/Plachtaa/seed-vc.git target
+  diffusion_steps: 50 # 30-50 = best quality
+  length_adjust: 1.0 # keep the event's original timing
+  cfg_rate: 0.7 # inference-cfg-rate
+  f0_condition: false # RMVPE pitch tracking is built for sung/spoken pitch and produces
+  # garbage on coughs/sniffs/throat-clearing; only flip to true for laughter
+
+splice:
+  placement: gap # legacy fallback if alignment (MFA/MMS) AND the proportional fallback
+  # both come back empty: "gap" (longest pause) | "before" | "after"
+  para_gain_db: -3.0 # level of the vocalisation vs. speech peak
+  pad_ms: 10 # silence either side of the insert — kept small: the cut point is a real
+  # mid-sentence word boundary, not a natural pause, so a big gap reads as a jump-cut
+  fade_ms: 50 # fade in/out on the insert at the splice point
+
+sample_rate: 22050 # Seed-VC's base vocoder rate; everything is resampled to this
+
+alignment:
+  # Stage order tried by para_synth.align.find_insert_time(), first success wins:
+  #   1. qwen3      — Qwen3-ForcedAligner-0.6B: no pronunciation dictionary needed, so it
+  #                    doesn't hit the MFA "spn" (OOV) problem cell 22 of the notebook was
+  #                    debugging for Vietnamese colloquial fillers/particles. Preferred.
+  #   2. mfa         — Montreal Forced Aligner + vietnamese_mfa (dictionary-based, cell 9-10)
+  #   3. mms         — torchaudio MMS_FA (cell 8's original fallback)
+  #   4. proportional — word-fraction estimate snapped to nearest silence (last resort)
+  use_qwen3: true
+  use_mfa: true
+  mfa_env_name: aligner
+  mfa_acoustic_model: vietnamese_mfa # covers Hanoi + Ho Chi Minh City dialects
+  mfa_dictionary: vietnamese_mfa
+  conda_dir: third_party/miniforge3 # only used if no conda is found at all
+
+models:
+  # third_party/models/ is laid out by pipeline purpose, not by vendor — see
+  # third_party/models/README.md. Local snapshot dirs fall back to downloading from the
+  # Hugging Face Hub id at run time if the local dir doesn't exist (see
+  # scripts/download_qwen3_models.sh for the offline-fetch step).
+  qwen3_asr_dir: third_party/models/asr/qwen3-asr-0.6b
+  qwen3_asr_hub_id: Qwen/Qwen3-ASR-0.6B
+  qwen3_forced_aligner_dir: third_party/models/aligner/qwen3-forcedaligner-0.6b
+  qwen3_forced_aligner_hub_id: Qwen/Qwen3-ForcedAligner-0.6B
+  # Seed-VC (conversion) manages its own checkpoint download inside its own repo — see
+  # third_party/models/conversion/README.md — so there's no separate path to configure here.
+  # Speaker-similarity/speaker-ID (para_synth/quality.py, third_party/models/speaker-id/)
+  # currently downloads microsoft/wavlm-base-plus-sv on demand; offline pre-fetch is not
+  # wired up yet.
+  speaker_id_dir: third_party/models/speaker-id/wavlm-base-plus-sv
+  speaker_id_hub_id: microsoft/wavlm-base-plus-sv
+
+paths:
+  raw_audio_dir: data/raw/audio
+  raw_transcript_dir: data/raw/transcripts
+  tagged_transcript_dir: data/tagged/transcripts
+  vocalsound_dir: data/vocalsound/audio_16k
+  work_dir: data/work # scratch: intermediate Seed-VC outputs, MFA corpora, etc.
+  output_dir: data/output/default_run
+
+asr:
+  # Used by `para-synth transcribe` for audio-only input (diagram: raw speech recording
+  # with no pre-existing transcript) — fills data/raw/transcripts/ via Qwen3-ASR before the
+  # rest of the pipeline runs. Not used when a transcript already exists for a clip.
+  language: Vietnamese # null -> auto-detect
+
+tagging:
+  backend: qwen # "qwen" | "gemini"
+  qwen_model: qwen-plus
+  gemini_model: gemini-2.5-flash

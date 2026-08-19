@@ -1,0 +1,38 @@
+[project]
+name = "para-synth"
+version = "0.1.0"
+description = "Seed-VC x VocalSound paralinguistic injection pipeline for Vietnamese speech data"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    "numpy<2",
+    "soundfile",
+    "torch",
+    "torchaudio",
+    "transformers==4.39.3",
+    "protobuf>=3.20.0,<4.0.0",
+    "pandas",
+    "pyyaml",
+    "requests",
+]
+
+[project.optional-dependencies]
+# Qwen3-ASR / Qwen3-ForcedAligner (para_synth/asr.py, para_synth/align/qwen3.py)
+qwen3 = ["qwen-asr"]
+# LLM transcript tagging (para_synth/tagging.py)
+tagging-qwen = ["openai"]
+tagging-gemini = ["google-generativeai"]
+# Better resampling (audio_utils.py falls back to torchaudio/numpy without it)
+audio-extra = ["soxr"]
+# Vietnamese romanization for the MMS_FA fallback aligner (para_synth/align/mms.py)
+mms = ["uroman"]
+
+[project.scripts]
+para-synth = "para_synth.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["para_synth*"]

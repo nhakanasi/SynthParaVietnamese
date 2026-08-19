@@ -1,0 +1,34 @@
+# Data — large/binary, layout documented in README.md. Folder structure is kept via
+# .gitkeep so `data/raw/audio` and `data/raw/transcripts` exist right after a clone.
+data/*
+!data/raw
+data/raw/*
+!data/raw/audio
+!data/raw/transcripts
+data/raw/audio/*
+!data/raw/audio/.gitkeep
+data/raw/transcripts/*
+!data/raw/transcripts/.gitkeep
+!data/tagged
+data/tagged/*
+!data/tagged/transcripts
+data/tagged/transcripts/*
+!data/tagged/transcripts/.gitkeep
+
+# Cloned/downloaded third-party code and model weights
+third_party/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Secrets
+.env
+
+# OS
+.DS_Store
