@@ -53,8 +53,12 @@ def cmd_tag_transcripts(args, cfg: Config) -> None:
         if out_path.is_file() and not args.overwrite:
             continue
         try:
-            result = insert_para_tag(row.text, backend=cfg.tagging.backend,
-                                      model=getattr(cfg.tagging, f"{cfg.tagging.backend}_model"))
+            result = insert_para_tag(
+                row.text,
+                backend=cfg.tagging.backend,
+                model=cfg.tagging.model_for_backend(),
+                audio_path=row.audio_filepath,  # used only by audio backends
+            )
             out_path.write_text(result.text, encoding="utf-8")
             print(f"🏷️  {row.id}: {result.tag} -> {out_path.name}")
             n_ok += 1

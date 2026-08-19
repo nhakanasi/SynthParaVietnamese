@@ -116,9 +116,16 @@ class PathsConfig:
 
 @dataclass
 class TaggingConfig:
-    backend: str = "qwen"  # "qwen" | "gemini"
+    # "qwen" / "gemini" send the transcript only. "qwen_omni_audio" also sends the
+    # recording so tag choice and placement can follow the actual delivery — richer, but
+    # costs more per row and caps audio length, so it stays opt-in.
+    backend: str = "qwen"
     qwen_model: str = "qwen-plus"
     gemini_model: str = "gemini-2.5-flash"
+    qwen_omni_audio_model: str = "qwen3-omni-flash"
+
+    def model_for_backend(self) -> str:
+        return getattr(self, f"{self.backend}_model")
 
 
 @dataclass

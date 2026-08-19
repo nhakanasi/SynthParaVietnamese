@@ -84,6 +84,12 @@ asr:
   language: Vietnamese # null -> auto-detect
 
 tagging:
-  backend: qwen # "qwen" | "gemini"
+  # "qwen" / "gemini"    — send the transcript text only (cheap, the default).
+  # "qwen_omni_audio"    — also send the recording, so the model picks a tag and a position
+  #                        that suit the actual delivery (a sigh after a slow breathy
+  #                        phrase, placed where the speaker pauses) instead of inferring
+  #                        from text alone. Costs more per row and caps audio at 150s.
+  backend: qwen
   qwen_model: qwen-plus
   gemini_model: gemini-2.5-flash
+  qwen_omni_audio_model: qwen3-omni-flash

@@ -20,7 +20,7 @@ dependencies = [
 # Qwen3-ASR / Qwen3-ForcedAligner (para_synth/asr.py, para_synth/align/qwen3.py)
 qwen3 = ["qwen-asr"]
 # LLM transcript tagging (para_synth/tagging.py)
-tagging-qwen = ["openai"]
+tagging-qwen = ["openai"]  # also covers the qwen_omni_audio backend (same SDK)
 tagging-gemini = ["google-generativeai"]
 # Better resampling (audio_utils.py falls back to torchaudio/numpy without it)
 audio-extra = ["soxr"]

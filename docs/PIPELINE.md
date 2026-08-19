@@ -190,6 +190,33 @@ re-proposed or "fixed in" without re-litigating the reasoning:
   benefits from seeing. The *soft* version of this idea is implemented instead — see
   "Clip selection" below.
 
+## Tagging: text-only vs. audio-conditioned
+
+`tagging.py` has two kinds of backend for the diagram's "Qwen/Gemini" box:
+
+- **Text-only** (`qwen`, `gemini`) — the default. Sends just the transcript; the model
+  infers which paralinguistic event fits from wording alone.
+- **Audio-conditioned** (`qwen_omni_audio`) — opt-in. Also sends the recording, so tag
+  choice *and* placement can follow the actual delivery: a sigh after a slow, breathy
+  phrase, positioned where the speaker really draws breath rather than wherever the text
+  suggests. Uses `qwen3-omni-flash` over DashScope's OpenAI-compatible endpoint.
+
+Two DashScope quirks the audio path has to honour, both required for the Omni models:
+the request **must be streamed** (a non-streamed call is rejected), and `modalities=["text"]`
+stops the model also synthesizing a spoken reply that would just be discarded. There's also
+a hard 150s audio cap on `qwen3-omni-flash`, guarded locally (`QWEN_OMNI_MAX_AUDIO_S`) so an
+over-long file fails with a clear message instead of an opaque API error.
+
+Audio conditioning costs meaningfully more per row than the text path, which is why it is
+not the default. Gemini's audio input is deliberately *not* wired up: Google's audio docs
+state Gemini "can only infer responses to English-language speech," which was not verified
+either way for Vietnamese — so only the Qwen path is implemented for now.
+
+Whichever backend runs, the output goes through the same mechanical check
+(`_extract_single_tag`): exactly one bracketed tag, drawn from `VS_CLASSES`, and stripping
+it back out must reproduce the input transcript exactly. Audio conditioning changes *which*
+tag is chosen, never the guarantee that nothing else was altered.
+
 ## Clip selection: energy-weighted, not filtered
 
 `pick_vocalsound_clip()` (`pipeline.py`) biases — never restricts — which clip a row gets.
