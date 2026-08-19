@@ -72,7 +72,7 @@ class AlignmentPipeline:
     def find_insert_time(self, row: ManifestRow, wav, sr, language: str | None = "Vietnamese") -> tuple[float, str]:
         qwen3 = self._get_qwen3()
         if qwen3 is not None:
-            t = qwen3.estimate_tag_time(wav, sr, row.text, language=language)
+            t = qwen3.estimate_tag_time(row.audio_filepath, row.text, language=language)
             if t is not None:
                 return t, "qwen3"
 

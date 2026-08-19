@@ -11,6 +11,8 @@ Requires the `qwen-asr` package (`pip install qwen-asr`).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from para_synth.align._text import words_around_tag
 
 
@@ -26,18 +28,26 @@ class Qwen3Aligner:
             model_source, device_map=device, dtype=torch_dtype
         )
 
-    def estimate_tag_time(self, wav, sr, text: str, language: str | None = "Vietnamese") -> float | None:
+    def estimate_tag_time(self, audio_path: str | Path, text: str, language: str | None = "Vietnamese") -> float | None:
         """Align only the real words around [tag] (not the bracket annotation itself)
-        against `wav`, and return the boundary between the word groups right before/after
-        it — same "before/after word groups" contract as align.mfa/align.mms, so the three
-        backends are interchangeable in align.find_insert_time()."""
+        against the audio at `audio_path`, and return the boundary between the word groups
+        right before/after it — same "before/after word groups" contract as
+        align.mfa/align.mms, so the three backends are interchangeable in
+        align.find_insert_time().
+
+        Takes a file path rather than a pre-loaded (wav, sr) array: the documented
+        qwen_asr API accepts a path/URL/base64/ndarray, but only a path lets the model's
+        own preprocessing pick the right resampling — an already-decoded array carries no
+        sample rate the API can recover, so passing one risks silently misinterpreting the
+        audio's duration.
+        """
         before_words, after_words = words_around_tag(text)
         if before_words is None:
             return None
 
         try:
             transcript = " ".join(before_words + after_words)
-            results = self.model.align(audio=(wav, sr), text=transcript, language=language)
+            results = self.model.align(audio=str(audio_path), text=transcript, language=language)
             items = results[0].items if hasattr(results[0], "items") else results[0]
 
             n_before = len(before_words)

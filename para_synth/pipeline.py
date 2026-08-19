@@ -61,7 +61,6 @@ def pick_vocalsound_clip(vs_dir: Path, vs_class: str, rng: random.Random, max_tr
 def synthesize_row(
     row: ManifestRow,
     cfg: Config,
-    align_pipeline: AlignmentPipeline,
     speaker_sim: SpeakerSimilarity,
     insert_at_s: float,
     insert_stage: str,
@@ -128,7 +127,7 @@ def synthesize_batch(rows: list[ManifestRow], cfg: Config, language: str | None 
             wav, sr = load_mono(row.audio_filepath)
             insert_at_s, insert_stage = align_pipeline.find_insert_time(row, wav, sr, language=language)
             print(f"   🧭 insertion time estimate: {insert_at_s:.2f}s (stage={insert_stage})")
-            result = synthesize_row(row, cfg, align_pipeline, speaker_sim, insert_at_s, insert_stage)
+            result = synthesize_row(row, cfg, speaker_sim, insert_at_s, insert_stage)
             results.append(result)
             print(f"   ✅ sim_converted={result.sim_converted:.3f} sim_raw_baseline={result.sim_raw_baseline:.3f} "
                   f"spliced@{result.splice_at_s:.2f}s")

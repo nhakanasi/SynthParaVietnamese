@@ -10,12 +10,13 @@ which is exactly the class of bug the notebook was diagnosing in its own cell 22
 """
 from __future__ import annotations
 
+import platform
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from para_synth.align._text import clean_word, words_around_tag
+from para_synth.align._text import words_around_tag
 from para_synth.config import AlignmentConfig
 from para_synth.dataset import ManifestRow
 
@@ -85,17 +86,12 @@ class MFAAligner:
                 print("📦 No conda found — bootstrapping Miniforge …")
                 installer = self.cfg.conda_dir.parent / "miniforge.sh"
                 installer.parent.mkdir(parents=True, exist_ok=True)
-                subprocess.run(
-                    [
-                        "curl", "-fsSL", "-o", str(installer),
-                        "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-"
-                        + ("MacOSX" if shutil.os.uname().sysname == "Darwin" else "Linux")
-                        + "-"
-                        + shutil.os.uname().machine
-                        + ".sh",
-                    ],
-                    check=True,
+                os_name = "MacOSX" if platform.system() == "Darwin" else "Linux"
+                installer_url = (
+                    f"https://github.com/conda-forge/miniforge/releases/latest/download/"
+                    f"Miniforge3-{os_name}-{platform.machine()}.sh"
                 )
+                subprocess.run(["curl", "-fsSL", "-o", str(installer), installer_url], check=True)
                 subprocess.run(["bash", str(installer), "-b", "-p", str(self.cfg.conda_dir)], check=True)
                 self.conda_bin = str(self.cfg.conda_dir / "bin" / "conda")
                 assert Path(self.conda_bin).is_file(), "Miniforge installer ran but its conda binary is still missing"
