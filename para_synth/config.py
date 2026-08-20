@@ -31,40 +31,75 @@ class SpliceConfig:
     para_gain_db: float = -3.0
     pad_ms: int = 10
     fade_ms: int = 50
-    # adaptive_splice() (para_synth.audio_utils) instead of splice(): inspects each
-    # junction's boundary RMS and only fades/widens the gap where the cut actually lands
-    # on active phonation, instead of always applying a fixed fade+pad. See audio_utils.py.
-    adaptive: bool = False
-    min_pad_ms: int = 10  # bridge width at a boundary that was already quiet
-    max_gap_ms: int = 70  # bridge width at a boundary that needed damping
+    # Which splice implementation in para_synth.audio_utils joins the event to the speech:
+    #   "tempo"    — tempo_splice(): exponential fades at both junctions + a room-tone gap
+    #                 sized to the speaker's own median pause. The default, because the
+    #                 forced-aligned cut lands mid-phonation in practice (20/20 rows of the
+    #                 first real batch) and the other two modes leave that audible.
+    #   "adaptive" — adaptive_splice(): fades/widens a junction only when its boundary RMS
+    #                 shows the cut landed on active phonation.
+    #   "fixed"    — splice(): the notebook's original, fixed fade+pad regardless of the cut.
+    mode: str = "tempo"
+    min_pad_ms: int = 10  # adaptive only: bridge width at a boundary that was already quiet
+    max_gap_ms: int = 70  # adaptive only: bridge width at a boundary that needed damping
+    # tempo only. gap_scale multiplies the measured median pause (1.0 = exactly the
+    # speaker's own tempo). fade_k is the exponential fade's curvature — higher damps faster.
+    gap_scale: float = 1.0
+    fade_k: float = 5.0
+
+    def __post_init__(self):
+        valid = {"tempo", "adaptive", "fixed"}
+        if self.mode not in valid:
+            raise ValueError(f"splice.mode must be one of {sorted(valid)}, got {self.mode!r}")
 
 
 @dataclass
 class SelectionConfig:
-    """How pick_vocalsound_clip() chooses which VocalSound clip to use for a row.
+    """How pick_vocalsound_clip() (para_synth/selection.py) chooses a VocalSound clip.
 
-    `energy_weight` = 0.0 is pure-random (every clip in the class equally likely). Higher
-    values bias sampling toward clips whose loudness is closer to the target speaker's own
-    recent level — a *soft* preference, never a hard filter: every clip keeps nonzero
-    probability, so genuinely loud-laugh-from-a-soft-speaker pairings still occur, just
-    less often than jarringly-mismatched ones otherwise would. See docs/PIPELINE.md.
+    Matching runs only on the axes Seed-VC does *not* normalise away. Speaker identity and
+    timbre are excluded on purpose — conversion handles those via the CAM++ style vector,
+    so selecting for them would double-count. What survives conversion untouched is the
+    clip's intensity, its recording channel, and its timing; those get one weight each.
+
+    All three are *soft* preferences, never hard filters: the axis distances are summed and
+    turned into a sampling weight `exp(-distance)`, so every usable candidate keeps nonzero
+    probability and the dataset keeps the acoustic variance a Para-TTS model benefits from.
+    All weights at 0.0 is pure-random (every clip in the class equally likely). ~1-2 is a
+    moderate bias per axis. See docs/PIPELINE.md.
     """
 
+    # Intensity: crest factor + duration percentile vs. the speaker's own energy percentile
+    # at the splice point. Seed-VC changes who is laughing, never how hard.
     energy_weight: float = 0.0
+    # Channel: SNR in dB and effective bandwidth in octaves. VocalSound is crowdsourced
+    # from whatever microphone each contributor had, and hiss/band-limiting is part of the
+    # signal Seed-VC reconstructs — the axis a clean recording most audibly rejects.
+    clarity_weight: float = 0.0
+    # Timing: envelope rate in octaves. Only applies to selection.TEMPO_MATCHED_CLASSES
+    # (laughter) — cough/sneeze/throat-clearing/sniff are reflexes with no link to
+    # speaking rate. Ignored for every other class regardless of this value.
+    tempo_weight: float = 0.0
     # Seconds of speech immediately before the splice point used as the speaker's
-    # reference level — local context, not the whole utterance, since a speaker's energy
-    # varies across a recording and what matters is the moment the event interrupts.
+    # reference level and pace — local context, not the whole utterance, since a speaker's
+    # energy varies across a recording and what matters is the moment the event interrupts.
+    # (Channel quality is measured over the whole recording instead — it's a property of
+    # the mic and the room, and a short window has too little silence to estimate it from.)
     context_s: float = 2.5
+    # Clips loaded and measured per row when any weight is on. Larger = better odds the
+    # pool contains a genuinely close match on all axes at once, at ~a few ms per clip
+    # against Seed-VC's ~16s of conversion, so this is cheap to raise.
+    candidate_pool: int = 48
+    # Hard gate, not a match: fraction of samples at full scale above which a candidate is
+    # dropped. Clipping is distortion Seed-VC faithfully reconstructs; unlike noise or
+    # bandwidth there's no target recording it can be "close to". Dropped rather than
+    # allowed to empty the pool, so it can never fail a row on its own.
+    max_clipping: float = 0.01
 
 
 @dataclass
 class AlignmentConfig:
     use_qwen3: bool = True
-    use_mfa: bool = True
-    mfa_env_name: str = "aligner"
-    mfa_acoustic_model: str = "vietnamese_mfa"
-    mfa_dictionary: str = "vietnamese_mfa"
-    conda_dir: Path = field(default_factory=lambda: REPO_ROOT / "third_party/miniforge3")
 
 
 @dataclass
@@ -105,6 +140,79 @@ class ASRConfig:
 
 
 @dataclass
+class NisqaConfig:
+    """Thresholds for the `filter` stage (para_synth/nisqa.py, pipeline.filter_batch()).
+
+    NISQA v2.0 predicts a MOS plus four degradation dimensions from a single recording, with
+    no clean reference to compare against. Every threshold here is optional: `None` means
+    the criterion isn't checked, and a row passes when every criterion that *is* set passes.
+    Rows that fail are recorded and left out of `metadata_filtered.jsonl`; nothing is
+    deleted, and every score is cached, so re-tuning a threshold costs no model time.
+
+    `max_mos_drop` is the primary criterion, and the reason the stage scores the source
+    recording as well as the finished one. An absolute floor mostly answers "was this corpus
+    clean", which is a property of the recordings the pipeline was handed rather than of
+    anything it did; the drop answers "did this pipeline degrade this recording", which is
+    the question the filter exists to ask, and it stays meaningful on a corpus that is
+    uniformly noisy or uniformly clean. Same self-calibrating-relative-measure reasoning as
+    selection.py's axis distances — see docs/PIPELINE.md.
+
+    The weights torchmetrics downloads are CC BY-NC-SA 4.0 (non-commercial). Setting
+    `enabled: false` means they are never fetched.
+    """
+
+    enabled: bool = True
+    # Each dimension has the same pair of criteria as the MOS: an absolute floor on the
+    # finished recording, and a cap on how far it fell below the source recording. All five
+    # values are 1-5 and higher-is-better, so a floor is a minimum and a drop is a maximum.
+    # `loudness` is deliberately absent: synthesize_row() peak-normalises its output, so a
+    # loudness difference measures that normalisation rather than anything the splice did.
+    min_mos: Optional[float] = None
+    max_mos_drop: Optional[float] = 0.5
+    min_noisiness: Optional[float] = None
+    max_noisiness_drop: Optional[float] = None
+    # `discontinuity` scores isolated interruptions, so its drop is the dimension that
+    # answers "did the splice leave an audible seam" more specifically than the MOS does.
+    min_discontinuity: Optional[float] = None
+    max_discontinuity_drop: Optional[float] = 0.4
+    min_coloration: Optional[float] = None
+    max_coloration_drop: Optional[float] = None
+
+
+@dataclass
+class QualityConfig:
+    """Which speaker encoder scores the conversions (para_synth/quality.py).
+
+    "campplus" is the same CAM++ encoder Seed-VC v1 conditions the conversion on, so it
+    measures the conversion in the space it was actually aimed at; it needs the seed-vc
+    checkout present. "wavlm" is an independent verifier that needs nothing but
+    transformers, which is why it stays the fallback default here.
+    """
+
+    speaker_embedder: str = "wavlm"  # "campplus" | "wavlm"
+
+    # Splice-junction check applied by the same `filter` stage, and the one criterion in
+    # here that needs no model at all. NISQA scores the *finished* recording, where the
+    # junction has already been faded and gapped, so a cut that landed in the middle of a
+    # vowel can still read as clean; this measures the source recording at the cut point
+    # instead, as the ratio between the energy right at the cut and the surrounding
+    # segment's own level (audio_utils.splice_boundary_activity). Higher = the aligner put
+    # the event further into active phonation. None = not checked; a row is judged on the
+    # louder of its two junctions. adaptive_splice() calls the same measure "active" above
+    # 0.2, but that is a threshold for *damping* a junction, not for rejecting a row.
+    max_boundary_activity: Optional[float] = None
+    nisqa: NisqaConfig = field(default_factory=NisqaConfig)
+
+    def __post_init__(self):
+        valid = {"campplus", "wavlm"}
+        if self.speaker_embedder not in valid:
+            raise ValueError(
+                f"quality.speaker_embedder must be one of {sorted(valid)}, "
+                f"got {self.speaker_embedder!r}"
+            )
+
+
+@dataclass
 class PathsConfig:
     raw_audio_dir: Path
     raw_transcript_dir: Path
@@ -112,6 +220,15 @@ class PathsConfig:
     vocalsound_dir: Path
     work_dir: Path
     output_dir: Path
+    # Per-stage artifacts (align.jsonl, quality.jsonl) that let each pipeline stage resume
+    # instead of recomputing. Scratch, same status as work_dir's converted clips — the
+    # dataset itself is what lands in output_dir.
+    stage_dir: Path = field(default_factory=lambda: REPO_ROOT / "data/work/stages")
+    # A JSONL manifest ({audio_filepath, text, ...}) to take rows from, instead of pairing
+    # raw_audio_dir with a transcript directory. None = use the directory layout. Such a
+    # manifest normally arrives with its `[tag]` already inline, so `transcribe` and
+    # `tag-transcripts` have nothing to do and the run is align -> synth -> filter.
+    manifest: Optional[Path] = None
 
 
 @dataclass
@@ -137,6 +254,7 @@ class Config:
     alignment: AlignmentConfig
     models: ModelsConfig
     asr: ASRConfig
+    quality: QualityConfig
     paths: PathsConfig
     tagging: TaggingConfig
     sample_rate: int = 22050
@@ -159,8 +277,15 @@ class Config:
         return random.Random(self.seed ^ int(digest[:16], 16))
 
     def ensure_dirs(self) -> None:
-        for d in (self.paths.work_dir, self.paths.output_dir):
+        for d in (self.paths.work_dir, self.paths.output_dir, self.paths.stage_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+
+def _quality_config(raw: dict) -> QualityConfig:
+    """`quality` is the one block with a nested sub-block (`nisqa`), so it can't go through
+    the plain `QualityConfig(**raw)` the other blocks use."""
+    raw = dict(raw)
+    return QualityConfig(nisqa=NisqaConfig(**raw.pop("nisqa", {})), **raw)
 
 
 def _resolve(root: Path, value: str) -> Path:
@@ -185,14 +310,7 @@ def load_config(path: str | Path = REPO_ROOT / "configs/default.yaml") -> Config
         ),
         splice=SpliceConfig(**raw["splice"]),
         selection=SelectionConfig(**raw.get("selection", {})),
-        alignment=AlignmentConfig(
-            use_qwen3=raw["alignment"].get("use_qwen3", True),
-            use_mfa=raw["alignment"]["use_mfa"],
-            mfa_env_name=raw["alignment"]["mfa_env_name"],
-            mfa_acoustic_model=raw["alignment"]["mfa_acoustic_model"],
-            mfa_dictionary=raw["alignment"]["mfa_dictionary"],
-            conda_dir=_resolve(root, raw["alignment"]["conda_dir"]),
-        ),
+        alignment=AlignmentConfig(use_qwen3=raw["alignment"].get("use_qwen3", True)),
         models=ModelsConfig(
             qwen3_asr_dir=_resolve(root, raw["models"]["qwen3_asr_dir"]),
             qwen3_asr_hub_id=raw["models"]["qwen3_asr_hub_id"],
@@ -202,6 +320,7 @@ def load_config(path: str | Path = REPO_ROOT / "configs/default.yaml") -> Config
             speaker_id_hub_id=raw["models"]["speaker_id_hub_id"],
         ),
         asr=ASRConfig(language=raw.get("asr", {}).get("language", "Vietnamese")),
+        quality=_quality_config(raw.get("quality", {})),
         paths=PathsConfig(
             raw_audio_dir=_resolve(root, paths["raw_audio_dir"]),
             raw_transcript_dir=_resolve(root, paths["raw_transcript_dir"]),
@@ -209,6 +328,8 @@ def load_config(path: str | Path = REPO_ROOT / "configs/default.yaml") -> Config
             vocalsound_dir=_resolve(root, paths["vocalsound_dir"]),
             work_dir=_resolve(root, paths["work_dir"]),
             output_dir=_resolve(root, paths["output_dir"]),
+            stage_dir=_resolve(root, paths.get("stage_dir", "data/work/stages")),
+            manifest=_resolve(root, paths["manifest"]) if paths.get("manifest") else None,
         ),
         tagging=TaggingConfig(**raw["tagging"]),
         sample_rate=raw.get("sample_rate", 22050),

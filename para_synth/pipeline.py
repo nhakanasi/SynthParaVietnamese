@@ -1,12 +1,17 @@
 """Orchestrates the full diagram: pick a VocalSound clip -> Seed-VC it into the speaker's
-voice -> score the conversion -> align the transcript's [tag] in time -> splice -> write the
-new "Para recording + tagged transcript" dataset row.
+voice -> score the conversion -> align the transcript's [tag] in time -> splice -> filter on
+predicted quality -> write the new "Para recording + tagged transcript" dataset row.
 
-Ported/generalized from notebook45ee5319ae.ipynb cell 25's batch loop.
+Ported/generalized from notebook45ee5319ae.ipynb cell 25's batch loop, then split into
+stages: `align_batch()` -> `synthesize_batch()` -> `filter_batch()`, each persisting what it
+produced and skipping rows it has already done. The split exists because the three stages
+differ in cost by orders of magnitude — alignment is a forward pass, synthesis is 50 steps of
+diffusion per row, filtering is about a second per row — so re-tuning a splice or a quality
+threshold shouldn't have to re-pay for the stage before it. See "Staged execution" in
+docs/PIPELINE.md for the artifact contracts.
 """
 from __future__ import annotations
 
-import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -15,12 +20,20 @@ import numpy as np
 import soundfile as sf
 
 from para_synth.align import AlignmentPipeline
-from para_synth.audio_utils import adaptive_splice, load_mono, splice, trim_event
+from para_synth.audio_utils import (
+    adaptive_splice,
+    load_mono,
+    splice,
+    splice_boundary_activity,
+    tempo_splice,
+    trim_event,
+)
 from para_synth.config import Config
-from para_synth.dataset import ManifestRow, extract_tag
-from para_synth.quality import SpeakerSimilarity
+from para_synth.dataset import ManifestRow, extract_tag, merge_by_id, read_jsonl, write_jsonl
+from para_synth.quality import SpeakerSimilarity, build_speaker_similarity
 from para_synth.seedvc import run_seedvc
-from para_synth.vocalsound import list_clips, match_vs_class
+from para_synth.selection import pick_vocalsound_clip, profile_speaker
+from para_synth.vocalsound import match_vs_class
 
 
 @dataclass
@@ -37,161 +50,15 @@ class SynthesisResult:
     insert_stage: str
     sim_converted: float
     sim_raw_baseline: float
-    # Selection audit trail — lets a run be checked for whether energy weighting actually
-    # tracked the speaker, and how much intensity spread survived in the dataset.
+    # Selection audit trail — lets a finished run be checked for whether each selection
+    # axis actually tracked the target recording, and how much spread survived in the
+    # dataset. `selection_axes` is {axis: {target…, clip…, distance}} from
+    # selection.pick_vocalsound_clip(); empty when all axis weights are off (uniform pick).
     vs_clip: str
     speaker_score: float
     clip_intensity: float
+    selection_axes: dict
 
-
-CANDIDATE_POOL_SIZE = 24  # clips actually loaded+scored per row when weighting is on
-
-
-def _usable_clip(trimmed, sr) -> bool:
-    return np.max(np.abs(trimmed)) > 0.05 and len(trimmed) / sr > 0.35
-
-
-def _finalize_clip(trimmed, sr):
-    """Normalise + pad to >=1s for Seed-VC's chunker."""
-    out = trimmed / (np.max(np.abs(trimmed)) + 1e-9) * 0.95
-    if len(out) / sr < 1.0:
-        pad = int((1.0 - len(out) / sr) * sr / 2)
-        out = np.pad(out, (pad, pad))
-    return out
-
-
-def _rms(x) -> float:
-    x = np.asarray(x, dtype=np.float64)
-    return float(np.sqrt(np.mean(x**2))) if len(x) else 0.0
-
-
-def clip_features(trimmed, sr) -> tuple[float, float]:
-    """Raw scale-invariant "how big is this vocalisation" features: (crest factor, duration).
-
-    Deliberately avoids absolute loudness: `_finalize_clip` peak-normalises every clip and
-    `splice` re-levels it against the speaker anyway, so a clip's raw amplitude tells you
-    about VocalSound's crowdsourced recording gain, not about how big the laugh was. What
-    *does* survive normalisation is shape — a big, sustained belly laugh has both a higher
-    crest factor (RMS close to its own peak, i.e. energy sustained rather than one
-    transient spike) and a longer duration than a short polite chuckle.
-
-    Returned raw and unscaled on purpose: these get converted to percentile ranks within
-    the actual candidate pool (see `_percentile_ranks`) rather than squashed through fixed
-    constants. An earlier version hardcoded reference values here and turned out to be
-    badly miscalibrated against real VocalSound data — measured crest factors cluster
-    around 0.11 (not the assumed ~0.5) and the median clip runs ~2.7s (saturating an
-    assumed 2s ceiling), so nearly every clip scored ~0.58 and the weighting below had
-    nothing to discriminate on. Percentile ranks are self-calibrating: whatever the real
-    distribution turns out to be, the ranks span 0..1 by construction.
-    """
-    peak = float(np.max(np.abs(trimmed))) + 1e-9
-    return _rms(trimmed) / peak, len(trimmed) / sr
-
-
-def _percentile_ranks(values: list[float]) -> list[float]:
-    """Map values to their rank within the list, scaled to 0..1 (ties share a rank)."""
-    n = len(values)
-    if n <= 1:
-        return [0.5] * n
-    order = sorted(range(n), key=lambda i: values[i])
-    ranks = [0.0] * n
-    for position, i in enumerate(order):
-        ranks[i] = position / (n - 1)
-    return ranks
-
-
-def speaker_energy_score(speech, sr, at_s: float, context_s: float) -> float:
-    """How loud is this speaker, in the moments before the splice point, *relative to
-    their own range across this recording*? 0..1, where ~0.9 means "one of the louder
-    moments for this speaker" and ~0.1 "one of their quieter moments".
-
-    Self-relative on purpose: absolute RMS across recordings mostly reflects mic and
-    recording gain, so comparing one speaker's raw level against another's — or against a
-    VocalSound clip's — would be meaningless.
-
-    Implemented as a percentile rank of the pre-splice window's RMS among all same-length
-    windows in the utterance, rather than a plain ratio against the utterance mean: a
-    ratio's spread depends on how dynamic the recording happens to be, and empirically
-    clustered near the middle for most speech, which left the sampling weight below with
-    almost no signal. A percentile rank spans 0..1 by construction.
-    """
-    win = max(int(context_s * sr), 1)
-    end = int(at_s * sr)
-    start = max(0, end - win)
-    context = speech[start:end]
-    if len(context) == 0 or len(speech) < win:
-        return 0.5
-
-    hop = max(win // 4, 1)
-    window_rms = [_rms(speech[i : i + win]) for i in range(0, len(speech) - win + 1, hop)]
-    if not window_rms:
-        return 0.5
-    ctx_rms = _rms(context)
-    # Fraction of windows quieter than the context — the context window isn't necessarily
-    # one of the sampled windows (it isn't aligned to the hop grid), so normalise by the
-    # window count, not count-1, to keep this in [0, 1].
-    below = sum(1 for r in window_rms if r < ctx_rms)
-    return below / len(window_rms)
-
-
-def pick_vocalsound_clip(
-    vs_dir: Path,
-    vs_class: str,
-    rng: random.Random,
-    max_tries: int = 12,
-    speaker_score: float | None = None,
-    energy_weight: float = 0.0,
-):
-    """Choose a VocalSound clip of `vs_class`, energy-trim it, normalise, and pad.
-
-    With `energy_weight == 0` (or no `speaker_score`), this is uniform random over the
-    class — every clip equally likely.
-
-    With `energy_weight > 0`, it loads a random candidate subset, ranks each candidate's
-    intensity *within that subset* (percentile rank of crest factor and duration, averaged
-    — see `clip_features`), and samples with weight `exp(-energy_weight * |clip_rank -
-    speaker_score|)` so clips whose intensity is closer to the speaker's own current level
-    are *more likely* but never exclusive. Every usable candidate keeps nonzero
-    probability: a big laugh from a soft-spoken speaker still happens (real people do
-    that), just less often than uniform sampling would produce it. This preserves the
-    acoustic variance a downstream Para-TTS model benefits from while making the typical
-    example less jarring — it is explicitly not a hard "soft speakers only get soft laughs"
-    filter, which would encode a stereotype that is often false.
-
-    Returns (name, finalized_clip, sr, intensity_rank). For the uniform path the returned
-    rank is 0.5 (unranked — there's no candidate set to rank against).
-    """
-    pool = list_clips(vs_dir, vs_class)
-    if not pool:
-        raise RuntimeError(f"No '{vs_class}' clips found in {vs_dir}")
-
-    if energy_weight <= 0 or speaker_score is None:
-        for _ in range(max_tries):
-            pick = rng.choice(pool)
-            raw, raw_sr = load_mono(vs_dir / pick)
-            cand = trim_event(raw, raw_sr)
-            if _usable_clip(cand, raw_sr):
-                return pick, _finalize_clip(cand, raw_sr), raw_sr, 0.5
-        raise RuntimeError(f"{max_tries} picks of '{vs_class}' were all too quiet/short")
-
-    candidates = rng.sample(pool, min(CANDIDATE_POOL_SIZE, len(pool)))
-    scored = []
-    for name in candidates:
-        raw, raw_sr = load_mono(vs_dir / name)
-        cand = trim_event(raw, raw_sr)
-        if _usable_clip(cand, raw_sr):
-            scored.append((name, cand, raw_sr, clip_features(cand, raw_sr)))
-    if not scored:
-        raise RuntimeError(f"none of {len(candidates)} sampled '{vs_class}' clips were usable")
-
-    crest_ranks = _percentile_ranks([f[0] for _, _, _, f in scored])
-    duration_ranks = _percentile_ranks([f[1] for _, _, _, f in scored])
-    intensities = [(c + d) / 2 for c, d in zip(crest_ranks, duration_ranks)]
-
-    weights = [np.exp(-energy_weight * abs(i - speaker_score)) for i in intensities]
-    idx = rng.choices(range(len(scored)), weights=weights, k=1)[0]
-    name, cand, raw_sr, _ = scored[idx]
-    return name, _finalize_clip(cand, raw_sr), raw_sr, intensities[idx]
 
 
 def synthesize_row(
@@ -208,18 +75,27 @@ def synthesize_row(
     vs_class = match_vs_class(nv_tag, rng)
 
     speech_arr, speech_sr = load_mono(row.audio_filepath, cfg.sample_rate)
-    speaker_score = speaker_energy_score(speech_arr, speech_sr, insert_at_s, cfg.selection.context_s)
+    # Measure the target on the axes Seed-VC won't fix (intensity, channel clarity, tempo)
+    # — not on identity/timbre, which the CAM++ style vector already handles downstream.
+    profile = profile_speaker(speech_arr, speech_sr, insert_at_s, cfg.selection.context_s)
 
-    vs_name, vs_clip, vs_sr, vs_intensity = pick_vocalsound_clip(
-        cfg.paths.vocalsound_dir, vs_class, rng,
-        speaker_score=speaker_score, energy_weight=cfg.selection.energy_weight,
+    pick = pick_vocalsound_clip(
+        cfg.paths.vocalsound_dir, vs_class, rng, cfg.selection, profile=profile,
     )
+    vs_name, vs_clip, vs_sr = pick.name, pick.audio, pick.sr
     vs_src_path = cfg.paths.work_dir / f"vs_{row.id}.wav"
     sf.write(vs_src_path, vs_clip, vs_sr, subtype="PCM_16")
 
     converted = run_seedvc(vs_src_path, row.audio_filepath, cfg.paths.work_dir / "output_vc", cfg.seedvc)
 
     conv_arr, conv_sr = load_mono(converted, cfg.sample_rate)
+    # Re-trim after conversion, not just before it: `_finalize_clip` zero-pads short clips
+    # to >=1s for Seed-VC's chunker, and Seed-VC returns that padding, so the converted
+    # event arrives with dead air at both ends (~140ms measured). Splicing it in unchanged
+    # means the fade at each junction is spent on padding while the event itself still
+    # starts at full amplitude — the silence around the event has to be one the splice
+    # chose, not one inherited from the chunker.
+    conv_arr = trim_event(conv_arr, conv_sr, pad_s=0.0)
 
     sim_converted = speaker_sim.similarity(speech_arr, speech_sr, conv_arr, conv_sr)
     sim_raw_baseline = speaker_sim.similarity(speech_arr, speech_sr, vs_clip, vs_sr)
@@ -227,7 +103,13 @@ def synthesize_row(
         print(f"   ⚠️  {row.id}: conversion didn't clearly beat the raw-clip baseline "
               f"({sim_converted:.3f} <= {sim_raw_baseline:.3f})")
 
-    if cfg.splice.adaptive:
+    if cfg.splice.mode == "tempo":
+        final, at = tempo_splice(
+            speech_arr, conv_arr, cfg.sample_rate, cfg.splice.para_gain_db,
+            cfg.splice.fade_ms, at_s=insert_at_s,
+            gap_scale=cfg.splice.gap_scale, fade_k=cfg.splice.fade_k,
+        )
+    elif cfg.splice.mode == "adaptive":
         final, at = adaptive_splice(
             speech_arr, conv_arr, cfg.sample_rate, cfg.splice.para_gain_db,
             cfg.splice.min_pad_ms, cfg.splice.max_gap_ms, cfg.splice.fade_ms,
@@ -258,38 +140,279 @@ def synthesize_row(
         sim_converted=sim_converted,
         sim_raw_baseline=sim_raw_baseline,
         vs_clip=vs_name,
-        speaker_score=speaker_score,
-        clip_intensity=vs_intensity,
+        speaker_score=profile.energy_rank,
+        clip_intensity=pick.intensity,
+        selection_axes=pick.axes,
     )
 
 
-def synthesize_batch(rows: list[ManifestRow], cfg: Config, language: str | None = "Vietnamese") -> list[SynthesisResult]:
-    """The full pipeline over a batch of already-tagged rows (see dataset.tagged_rows).
-    Writes `metadata_synth.jsonl` into cfg.paths.output_dir — the diagram's "new dataset"."""
-    cfg.ensure_dirs()
-    align_pipeline = AlignmentPipeline(cfg.alignment, cfg.models)
-    align_pipeline.prepare_mfa_batch(rows, cfg.paths.work_dir / "mfa_corpus", cfg.paths.work_dir / "mfa_aligned")
-    speaker_sim = SpeakerSimilarity(cfg.models.speaker_id_source())
+def _file_stamp(path) -> list | None:
+    """[size, mtime_ns] for a file, or None if it's gone (or unrecorded) — how a cached
+    stage artifact tells whether the audio it describes is still the audio on disk."""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    st = p.stat()
+    return [st.st_size, st.st_mtime_ns]
 
-    results: list[SynthesisResult] = []
-    for i, row in enumerate(rows, 1):
-        print(f"\n[{i}/{len(rows)}] {row.id}")
+
+def _measurement_is_current(cached: dict, row: dict, need_nisqa: bool) -> bool:
+    """Whether a cached `filter`-stage measurement still describes this synthesized row.
+
+    Two independent halves, because the two measures depend on different things:
+
+    * the splice-boundary activity is a function of the source recording and the insertion
+      time, so it is current while the cached `splice_at_s` matches the row's;
+    * the NISQA scores describe one particular rendering of `para_*.wav`, which
+      `synth --force` overwrites in place — the id alone can't tell them apart, so the
+      size+mtime stamp is what makes a re-synthesized row get re-scored rather than inherit
+      the previous take's numbers. A cached entry with no stamp at all is stale by
+      definition, not a match against a missing file's `None`.
+    """
+    if cached.get("splice_at_s") != row.get("splice_at_s"):
+        return False
+    if not need_nisqa:
+        return True
+    stamp = cached.get("para_stat")
+    return stamp is not None and stamp == _file_stamp(cached.get("para_audio"))
+
+
+def align_path(cfg: Config) -> Path:
+    return cfg.paths.stage_dir / "align.jsonl"
+
+
+def synth_path(cfg: Config) -> Path:
+    return cfg.paths.output_dir / "metadata_synth.jsonl"
+
+
+def quality_path(cfg: Config) -> Path:
+    """The `filter` stage's measurement cache. Named for the stage rather than for NISQA
+    because it also holds the splice-boundary measure, which needs no model."""
+    return cfg.paths.stage_dir / "quality.jsonl"
+
+
+def filter_is_configured(cfg: Config) -> bool:
+    """Whether the `filter` stage has any criterion to apply. Both of its measures are
+    independently switchable, so with NISQA disabled and no boundary threshold set there is
+    nothing to filter on and the stage would only copy its input."""
+    return cfg.quality.nisqa.enabled or cfg.quality.max_boundary_activity is not None
+
+
+def filtered_path(cfg: Config) -> Path:
+    return cfg.paths.output_dir / "metadata_filtered.jsonl"
+
+
+def align_batch(
+    rows: list[ManifestRow],
+    cfg: Config,
+    language: str | None = "Vietnamese",
+    force: bool = False,
+) -> list[dict]:
+    """Stage 1: where in each recording the transcript's `[tag]` belongs.
+
+    Writes `{id, insert_at_s, insert_stage}` per row to `stages/align.jsonl`. Rows already
+    in that file are skipped unless `force`, which is what makes re-running the rest of the
+    pipeline free of the aligner's model load.
+    """
+    cfg.ensure_dirs()
+    out_path = align_path(cfg)
+    cached = read_jsonl(out_path)
+    done = {r["id"] for r in cached}
+    todo = list(rows) if force else [r for r in rows if r.id not in done]
+
+    if not todo:
+        print(f"⏭️  all {len(rows)} rows already aligned -> {out_path}")
+        return cached
+
+    align_pipeline = AlignmentPipeline(cfg.alignment, cfg.models)
+    fresh: list[dict] = []
+    for i, row in enumerate(todo, 1):
+        print(f"\n[{i}/{len(todo)}] {row.id}")
         try:
             wav, sr = load_mono(row.audio_filepath)
             insert_at_s, insert_stage = align_pipeline.find_insert_time(row, wav, sr, language=language)
             print(f"   🧭 insertion time estimate: {insert_at_s:.2f}s (stage={insert_stage})")
-            result = synthesize_row(row, cfg, speaker_sim, insert_at_s, insert_stage)
-            results.append(result)
+            fresh.append({"id": row.id, "insert_at_s": insert_at_s, "insert_stage": insert_stage})
+        except Exception as e:
+            print(f"   ⚠️  skipped {row.id}: {type(e).__name__}: {e}")
+
+    merged = merge_by_id(cached, fresh)
+    write_jsonl(out_path, merged)
+    print(f"\n🧭 {len(fresh)}/{len(todo)} rows aligned ({len(merged)} total) -> {out_path}")
+    return merged
+
+
+def synthesize_batch(rows: list[ManifestRow], cfg: Config, force: bool = False) -> list[dict]:
+    """Stage 2: convert, splice, and write one Para recording per row.
+
+    Reads the insertion times from `stages/align.jsonl` (run `align_batch()` first — a row
+    with no alignment is skipped rather than guessed at), and appends to
+    `metadata_synth.jsonl` in cfg.paths.output_dir, the diagram's "new dataset".
+
+    A row counts as done only when its metadata entry *and* its `para_*.wav` both exist, so
+    deleting an output file is enough to make this stage rebuild it.
+    """
+    cfg.ensure_dirs()
+    alignments = {r["id"]: r for r in read_jsonl(align_path(cfg))}
+    if not alignments:
+        raise FileNotFoundError(
+            f"no alignments at {align_path(cfg)} — run `para-synth align` (or `para-synth run`) first"
+        )
+
+    out_path = synth_path(cfg)
+    cached = read_jsonl(out_path)
+    done = {r["id"] for r in cached if Path(r["para_audio"]).is_file()}
+
+    todo, unaligned = [], []
+    for row in rows:
+        if row.id not in alignments:
+            unaligned.append(row.id)
+        elif force or row.id not in done:
+            todo.append(row)
+    if unaligned:
+        print(f"⚠️  {len(unaligned)} row(s) have no alignment and were skipped: {', '.join(unaligned[:5])}"
+              + (f" … +{len(unaligned) - 5} more" if len(unaligned) > 5 else ""))
+    if not todo:
+        print(f"⏭️  all {len(rows) - len(unaligned)} aligned rows already synthesized -> {out_path}")
+        return cached
+
+    speaker_sim = build_speaker_similarity(cfg)
+    fresh: list[dict] = []
+    for i, row in enumerate(todo, 1):
+        print(f"\n[{i}/{len(todo)}] {row.id}")
+        align = alignments[row.id]
+        try:
+            result = synthesize_row(row, cfg, speaker_sim, align["insert_at_s"], align["insert_stage"])
+            fresh.append(asdict(result))
             print(f"   ✅ sim_converted={result.sim_converted:.3f} sim_raw_baseline={result.sim_raw_baseline:.3f} "
                   f"spliced@{result.splice_at_s:.2f}s")
         except Exception as e:
             print(f"   ⚠️  skipped {row.id}: {type(e).__name__}: {e}")
 
-    out_path = cfg.paths.output_dir / "metadata_synth.jsonl"
-    with open(out_path, "w", encoding="utf-8") as fh:
-        for r in results:
-            fh.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
-
-    print(f"\n📦 {len(results)}/{len(rows)} rows synthesized -> {cfg.paths.output_dir}")
+    merged = merge_by_id(cached, fresh)
+    write_jsonl(out_path, merged)
+    print(f"\n📦 {len(fresh)}/{len(todo)} rows synthesized ({len(merged)} total) -> {cfg.paths.output_dir}")
     print(f"   metadata: {out_path}")
-    return results
+    return merged
+
+
+def filter_batch(cfg: Config, force: bool = False) -> list[dict]:
+    """Stage 3: measure every finished row and keep the ones that pass.
+
+    Two measures, deliberately independent because they answer different questions:
+
+    * **NISQA** scores the source recording *and* the Para recording, all five dimensions,
+      unconditionally — thresholds are applied afterwards. It hears hiss, coloration and
+      audible seams in the delivered file.
+    * **Splice-boundary activity** measures the source recording at the insertion time. It
+      is what NISQA structurally cannot see: by the time the file is written both junctions
+      have been fade-damped and separated by a room-tone gap, so a cut taken from the middle
+      of a vowel still scores as a clean signal even though the event interrupts the speaker
+      mid-word. Costs no model — it is read off audio the stage already loads.
+
+    Everything measured lands in `stages/quality.jsonl`; the passing subset of
+    `metadata_synth.jsonl` goes to `metadata_filtered.jsonl` carrying its measurements.
+    Nothing is deleted and no row is measured twice, so re-tuning a threshold re-reads the
+    cache and never loads the model. See para_synth/nisqa.py.
+    """
+    from para_synth.nisqa import NisqaScorer, failed_criteria
+
+    if not filter_is_configured(cfg):
+        raise RuntimeError(
+            "the filter stage has no criteria: quality.nisqa.enabled is false and "
+            "quality.max_boundary_activity is null, so every row would pass. Enable one of "
+            "them, or drop the stage from your run."
+        )
+
+    cfg.ensure_dirs()
+    rows = read_jsonl(synth_path(cfg))
+    if not rows:
+        raise FileNotFoundError(
+            f"no synthesized rows at {synth_path(cfg)} — run `para-synth synth` (or `para-synth run`) first"
+        )
+
+    need_nisqa = cfg.quality.nisqa.enabled
+    cache_path = quality_path(cfg)
+    cached = read_jsonl(cache_path)
+    by_id = {r["id"]: r for r in cached}
+    measured = (
+        {}
+        if force
+        else {
+            row["id"]: by_id[row["id"]]
+            for row in rows
+            if row["id"] in by_id and _measurement_is_current(by_id[row["id"]], row, need_nisqa)
+        }
+    )
+    todo = [r for r in rows if r["id"] not in measured]
+
+    if todo:
+        # Only pay for the model when something actually needs scoring — a threshold change
+        # alone leaves `todo` empty and this whole branch is skipped.
+        scorer = NisqaScorer() if need_nisqa else None
+        for i, row in enumerate(todo, 1):
+            print(f"[{i}/{len(todo)}] {row['id']}", end=" ")
+            try:
+                source_wav, source_sr = load_mono(Path(row["source_audio"]), cfg.sample_rate)
+                before, after = splice_boundary_activity(source_wav, source_sr, row["splice_at_s"])
+                entry = {
+                    "id": row["id"],
+                    "para_audio": row["para_audio"],
+                    "para_stat": _file_stamp(row["para_audio"]),
+                    "splice_at_s": row["splice_at_s"],
+                    "boundary_activity": {"before": before, "after": after},
+                }
+                report = f"boundary {before:.2f}/{after:.2f}"
+                if scorer is not None:
+                    para_wav, para_sr = load_mono(Path(row["para_audio"]), cfg.sample_rate)
+                    entry["source"] = scorer.score(source_wav, source_sr)
+                    entry["para"] = scorer.score(para_wav, para_sr)
+                    report = (f"mos {entry['source']['mos']:.2f} -> {entry['para']['mos']:.2f} "
+                              f"(drop {entry['source']['mos'] - entry['para']['mos']:+.2f}) " + report)
+                prior = by_id.get(row["id"])
+                if scorer is None and prior and prior.get("para_stat") == entry["para_stat"]:
+                    # Re-measuring with NISQA switched off would otherwise drop scores that
+                    # are still valid for this exact file — expensive output, thrown away by
+                    # a run that simply wasn't asking about it.
+                    entry |= {k: prior[k] for k in ("source", "para") if k in prior}
+                measured[row["id"]] = entry
+                print(report)
+            except Exception as e:
+                print(f"⚠️  measuring failed: {type(e).__name__}: {e}")
+        write_jsonl(cache_path, merge_by_id(cached, list(measured.values())))
+    else:
+        print(f"⏭️  reusing cached quality measurements for {len(rows)} rows -> {cache_path}")
+
+    limit = cfg.quality.max_boundary_activity
+    kept, rejected = [], []
+    for row in rows:
+        entry = measured.get(row["id"])
+        if entry is None:  # measuring failed for this row — it can't be judged, so keep it
+            kept.append(row)
+            continue
+
+        failures = failed_criteria(entry, cfg.quality.nisqa) if need_nisqa else []
+        boundary = entry["boundary_activity"]
+        # Judged on the louder junction: one clean side doesn't excuse an event that starts
+        # mid-syllable, and the two junctions are independent places for that to happen.
+        worst = max(boundary["before"], boundary["after"])
+        if limit is not None and worst > limit:
+            side = "before" if boundary["before"] >= boundary["after"] else "after"
+            failures.append(f"boundary_activity {worst:.2f} ({side}) > {limit}")
+
+        enriched = {**row, "boundary_activity": boundary}
+        if need_nisqa:
+            enriched |= {"nisqa_source": entry["source"], "nisqa_para": entry["para"]}
+        if failures:
+            rejected.append((row["id"], failures))
+        else:
+            kept.append(enriched)
+
+    out_path = filtered_path(cfg)
+    write_jsonl(out_path, kept)
+    print(f"\n🔎 quality filter: {len(kept)}/{len(rows)} rows kept -> {out_path}")
+    for row_id, failures in rejected:
+        print(f"   ❌ {row_id}: {'; '.join(failures)}")
+    return kept

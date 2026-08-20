@@ -10,6 +10,12 @@ cd "$(dirname "$0")/.."
 FILES=(README.md chat_template.json config.json generation_config.json merges.txt
        preprocessor_config.json tokenizer_config.json vocab.json model.safetensors)
 
+# Downloads land in "$f.part" and are only renamed once curl exits 0. Without that, an
+# interrupted transfer leaves a short "$f" that the "already present" check below happily
+# skips forever — which is how a truncated model.safetensors got this far once, failing at
+# load time with "SafetensorError: incomplete metadata, file not fully covered" rather than
+# at download time. Any leftover .part is re-fetched from scratch, not resumed, since a
+# .part from a different revision would resume into a corrupt file.
 fetch() {
   local repo="$1" dest="$2"
   mkdir -p "$dest"
@@ -19,7 +25,8 @@ fetch() {
       continue
     fi
     echo "📥 $repo/$f"
-    curl -fL --retry 3 -o "$dest/$f" "https://huggingface.co/$repo/resolve/main/$f"
+    curl -fL --retry 3 -o "$dest/$f.part" "https://huggingface.co/$repo/resolve/main/$f"
+    mv "$dest/$f.part" "$dest/$f"
   done
 }
 

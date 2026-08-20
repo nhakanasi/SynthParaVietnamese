@@ -17,7 +17,7 @@ data/tagged/transcripts/*
 
 # Cloned/downloaded third-party code and model weights
 third_party/
-
+CLAUDE.md
 # Python
 __pycache__/
 *.pyc

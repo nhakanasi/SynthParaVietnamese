@@ -1,10 +1,11 @@
 """Qwen3-ForcedAligner backend — first choice in the alignment chain.
 
-New (not in the source notebook, which only had MMS_FA + MFA + proportional). Unlike MFA,
-Qwen3-ForcedAligner needs no pronunciation dictionary and handles accented/multilingual
-speech natively (Vietnamese is one of its supported languages), which sidesteps the
-"spn" OOV problem `para_synth.align.mfa` has to defend against for colloquial Vietnamese
-fillers/particles. Model: Qwen/Qwen3-ForcedAligner-0.6B — see
+New (not in the source notebook, which only had MMS_FA + MFA + proportional). Needs no
+pronunciation dictionary and handles accented/multilingual speech natively (Vietnamese is
+one of its supported languages), which sidesteps the "spn" out-of-vocabulary problem that
+made the dictionary-based Montreal Forced Aligner stage unusable for colloquial Vietnamese
+fillers/particles — and, since this stage resolves every row in practice, is why that stage
+was removed outright (see docs/PIPELINE.md: "Alignment stage order"). Model: Qwen/Qwen3-ForcedAligner-0.6B — see
 third_party/models/README.md for where the offline weights live.
 
 Requires the `qwen-asr` package (`pip install qwen-asr`).
@@ -32,8 +33,7 @@ class Qwen3Aligner:
         """Align only the real words around [tag] (not the bracket annotation itself)
         against the audio at `audio_path`, and return the boundary between the word groups
         right before/after it — same "before/after word groups" contract as
-        align.mfa/align.mms, so the three backends are interchangeable in
-        align.find_insert_time().
+        align.mms, so the backends are interchangeable in align.find_insert_time().
 
         Takes a file path rather than a pre-loaded (wav, sr) array: the documented
         qwen_asr API accepts a path/URL/base64/ndarray, but only a path lets the model's

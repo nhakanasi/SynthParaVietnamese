@@ -22,7 +22,7 @@ def estimate_tag_time_proportional(text: str, duration_s: float) -> float:
 def find_local_silence_near(speech, sr, target_s, search_s=0.5, top_db=35) -> float:
     """Snap an estimated insertion time to the nearest actual quiet moment within
     ±search_s of it. Only used for the proportional fallback — a real alignment result
-    (qwen3/mfa/mms) is trusted as-is instead, since the tag is a post-hoc annotation and
+    (qwen3/mms) is trusted as-is instead, since the tag is a post-hoc annotation and
     there's no guarantee of a genuine pause there."""
     target = int(target_s * sr)
     lo = max(0, target - int(search_s * sr))

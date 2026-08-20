@@ -26,6 +26,10 @@ tagging-gemini = ["google-generativeai"]
 audio-extra = ["soxr"]
 # Vietnamese romanization for the MMS_FA fallback aligner (para_synth/align/mms.py)
 mms = ["uroman"]
+# NISQA quality filter, the `filter` stage (para_synth/nisqa.py). Optional because nothing
+# else needs it, and because the model weights torchmetrics fetches are CC BY-NC-SA 4.0
+# (non-commercial) — see the licence note in configs/default.yaml.
+nisqa = ["torchmetrics>=1.5", "librosa", "requests"]
 
 [project.scripts]
 para-synth = "para_synth.cli:main"

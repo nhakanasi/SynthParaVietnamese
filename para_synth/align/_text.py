@@ -1,4 +1,4 @@
-"""Shared text-prep helpers for the alignment backends (mfa.py, mms.py, qwen3.py).
+"""Shared text-prep helpers for the alignment backends (mms.py, qwen3.py).
 
 Ported from notebook45ee5319ae.ipynb cells 8, 10.
 """

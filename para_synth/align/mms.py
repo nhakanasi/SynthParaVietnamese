@@ -1,10 +1,11 @@
-"""torchaudio MMS_FA forced alignment — third fallback in the alignment chain (after
-qwen3, mfa), ahead of the proportional last resort. Ported from notebook45ee5319ae.ipynb
+"""torchaudio MMS_FA forced alignment — the acoustic backstop in the alignment chain (after
+qwen3), ahead of the proportional last resort. Ported from notebook45ee5319ae.ipynb
 cell 8's "stage 1".
 
-Kept mainly as a dependency-light fallback for when neither Qwen3-ForcedAligner nor MFA is
-set up: torchaudio ships MMS_FA, so this needs no extra download beyond what seed-vc's own
-requirements.txt already pulls in.
+Kept as a dependency-light fallback for when Qwen3-ForcedAligner isn't set up or fails on a
+row: torchaudio ships MMS_FA, so this needs no extra download beyond what seed-vc's own
+requirements.txt already pulls in — which is also why it survived the removal of the
+Montreal Forced Aligner stage (see docs/PIPELINE.md: "Alignment stage order").
 """
 from __future__ import annotations
 

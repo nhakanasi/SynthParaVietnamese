@@ -2,10 +2,21 @@
 original speaker? Ported from notebook45ee5319ae.ipynb cell 17.
 
 Seed-VC's job in this pipeline is to re-voice a VocalSound clip into each speaker's own
-timbre. This loads a speaker-verification model (`microsoft/wavlm-base-plus-sv`, pure
-transformers/torch — no librosa, so it doesn't hit the numpy-version landmine noted in
-audio_utils.py) and scores each conversion with cosine similarity between x-vector
-embeddings:
+timbre. This loads a speaker-verification model and scores each conversion with cosine
+similarity between speaker embeddings. Two backends, chosen by `quality.speaker_embedder`:
+
+* `campplus` — the *same* CAM++ speaker encoder Seed-VC v1's `inference.py` uses to build
+  the style vector it conditions the conversion on (`funasr/campplus`,
+  `campplus_cn_common.bin`, via seed-vc's vendored `modules.campplus.DTDNN`). Scoring in
+  the embedding space the model actually cloned in answers "did the conversion land where
+  it was aimed", which is the question this check exists to ask.
+* `wavlm` — `microsoft/wavlm-base-plus-sv`, an independent verifier. Needs no seed-vc
+  checkout and is the fallback when one isn't available, but it judges the conversion from
+  outside the space it was optimised for, so a conversion can be a faithful clone by CAM++
+  and still score modestly here.
+
+Both are pure transformers/torch — no librosa, so neither hits the numpy-version landmine
+noted in audio_utils.py. Both report:
 
 * `sim_converted` — original speech vs. the Seed-VC output. High = the conversion actually
   sounds like that speaker.
@@ -23,7 +34,9 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
+import numpy as np
 import torch
 
 from para_synth.audio_utils import _resample
@@ -66,3 +79,73 @@ class SpeakerSimilarity:
         ea = self.embedding(wav_a, sr_a)
         eb = self.embedding(wav_b, sr_b)
         return torch.nn.functional.cosine_similarity(ea, eb, dim=0).item()
+
+
+class CampPlusSimilarity:
+    """CAM++ speaker embeddings, loaded from seed-vc's own vendored implementation.
+
+    Deliberately imports `modules.campplus.DTDNN` out of the seed-vc checkout rather than
+    reimplementing or pip-installing another copy: the point of this backend is that the
+    embedding is bit-for-bit the one `inference.py` conditioned the conversion on, and a
+    second implementation (different fbank defaults, different checkpoint revision) would
+    quietly stop being that. The cost is that this backend needs `seedvc.repo_dir` present
+    — hence `wavlm` staying available as the standalone option.
+
+    Feature extraction mirrors inference.py exactly: 80-bin kaldi fbank at 16k, dither=0,
+    mean-normalised over time.
+    """
+
+    sr = 16000
+
+    def __init__(self, seedvc_repo_dir):
+        import torch
+        import torchaudio  # noqa: F401  — imported here so a missing torchaudio fails loudly
+
+        repo = str(Path(seedvc_repo_dir))
+        if not (Path(repo) / "modules" / "campplus" / "DTDNN.py").is_file():
+            raise FileNotFoundError(
+                f"CAM++ speaker embedding needs seed-vc's vendored modules, not found under "
+                f"{repo}. Run `para-synth setup-seedvc`, or set quality.speaker_embedder: wavlm."
+            )
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        from modules.campplus.DTDNN import CAMPPlus
+
+        from huggingface_hub import hf_hub_download
+
+        ckpt = hf_hub_download("funasr/campplus", "campplus_cn_common.bin")
+        print(f"🧠 Loading CAM++ ({ckpt}) for speaker-similarity scoring …")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = CAMPPlus(feat_dim=80, embedding_size=192)
+        self.model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        self.model = self.model.eval().to(self.device)
+
+    @torch.no_grad()
+    def embedding(self, wav, sr):
+        import torchaudio
+
+        if sr != self.sr:
+            wav = _resample(wav, sr, self.sr)
+        x = torch.from_numpy(np.ascontiguousarray(wav)).float().unsqueeze(0)
+        feat = torchaudio.compliance.kaldi.fbank(
+            x, num_mel_bins=80, dither=0, sample_frequency=self.sr
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        return self.model(feat.unsqueeze(0).to(self.device))[0]
+
+    def similarity(self, wav_a, sr_a, wav_b, sr_b) -> float:
+        ea = self.embedding(wav_a, sr_a)
+        eb = self.embedding(wav_b, sr_b)
+        return torch.nn.functional.cosine_similarity(ea, eb, dim=0).item()
+
+
+def build_speaker_similarity(cfg):
+    """Pick the speaker-embedding backend named by `quality.speaker_embedder`."""
+    backend = cfg.quality.speaker_embedder
+    if backend == "campplus":
+        return CampPlusSimilarity(cfg.seedvc.repo_dir)
+    if backend == "wavlm":
+        return SpeakerSimilarity(cfg.models.speaker_id_source())
+    raise ValueError(
+        f"quality.speaker_embedder must be 'campplus' or 'wavlm', got {backend!r}"
+    )

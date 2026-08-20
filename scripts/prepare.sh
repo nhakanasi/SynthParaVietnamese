@@ -5,8 +5,7 @@
 # Every step is idempotent and independently skippable, so this is safe to re-run after a
 # partial or failed setup — it detects what's already in place and moves on.
 #
-#   ./scripts/prepare.sh                 # everything except MFA
-#   ./scripts/prepare.sh --with-mfa      # also bootstrap Montreal Forced Aligner
+#   ./scripts/prepare.sh                 # everything
 #   ./scripts/prepare.sh --venv          # create+use ./.venv instead of the ambient python
 #   ./scripts/prepare.sh --skip-dataset  # skip the ~2.9GB VocalSound download
 #
@@ -15,7 +14,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-WITH_MFA=0
 USE_VENV=0
 SKIP_DEPS=0
 SKIP_SEEDVC=0
@@ -23,13 +21,11 @@ SKIP_MODELS=0
 SKIP_DATASET=0
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Flags:
   --venv           create and use ./.venv rather than the active python
-  --with-mfa       also bootstrap Montreal Forced Aligner (slow; optional — the Qwen3
-                   aligner is tried first and needs no conda)
   --skip-deps      don't pip install
   --skip-seedvc    don't clone/install Seed-VC
   --skip-models    don't download Qwen3 ASR/aligner weights (~3.6GB)
@@ -41,7 +37,6 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --venv) USE_VENV=1 ;;
-    --with-mfa) WITH_MFA=1 ;;
     --skip-deps) SKIP_DEPS=1 ;;
     --skip-seedvc) SKIP_SEEDVC=1 ;;
     --skip-models) SKIP_MODELS=1 ;;
@@ -102,7 +97,7 @@ done
 if [ "$SKIP_DEPS" = 0 ]; then
   step "Installing para-synth + extras"
   $PY -m pip install --upgrade pip -q
-  $PY -m pip install -e ".[qwen3,tagging-qwen,audio-extra,mms]"
+  $PY -m pip install -e ".[tagging-qwen,audio-extra,mms,nisqa]"
   ok "package installed (editable)"
   record "para-synth CLI installed"
 else
@@ -132,11 +127,48 @@ else
   warn "skipping Seed-VC setup"
 fi
 
+# ── 3a · CUDA torch ──────────────────────────────────────────────────────────
+# seed-vc's requirements.txt asks for nightly cu126 wheels in its first three lines and then
+# pins bare `torch==2.4.0` further down; pip is last-write-wins, so step 3 always leaves a
+# CPU-only torch behind. Silent, not loud — the pipeline still runs, ~32x slower for Seed-VC
+# (measured: 530s vs 16.5s per row). torch 2.4 is also too old for anything newer than
+# Hopper, so a current card gets no GPU at all rather than an error. Override the wheel
+# index with TORCH_CUDA_INDEX if cu128 isn't right for your driver.
+TORCH_CUDA_INDEX="${TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu128}"
+if [ "$SKIP_DEPS" = 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
+  step "Reinstalling torch with CUDA support"
+  if $PY -m pip install --index-url "$TORCH_CUDA_INDEX" torch torchaudio torchvision; then
+    ok "CUDA torch installed"
+    record "torch built for CUDA (para-synth doctor verifies it can see the GPU)"
+  else
+    warn "CUDA torch install failed — the pipeline will run on CPU and be very slow"
+  fi
+fi
+
+# ── 3b · Qwen3 forced aligner ────────────────────────────────────────────────
+# Deliberately the LAST install, after Seed-VC rather than alongside our own deps in step 2:
+# qwen-asr pins transformers==4.57.6, and Qwen3-ForcedAligner-0.6B's config declares
+# model_type "qwen3_asr" — an architecture older transformers releases don't know, so if
+# Seed-VC's requirements land afterwards and pull transformers back down, the aligner can't
+# load at all. Seed-VC runs fine on 4.57.6 (verified end-to-end), so the newer pin wins.
+if [ "$SKIP_DEPS" = 0 ]; then
+  step "Installing the Qwen3 forced aligner (qwen-asr)"
+  if $PY -m pip install -e ".[qwen3]"; then
+    ok "qwen-asr installed"
+    record "Qwen3 forced aligner available (first stage of the align chain)"
+  else
+    warn "qwen-asr install failed — the align chain falls back to MMS"
+  fi
+fi
+
 # ── 4 · Qwen3 model weights ──────────────────────────────────────────────────
 if [ "$SKIP_MODELS" = 0 ]; then
   step "Downloading Qwen3 ASR + forced-aligner weights (~3.6GB)"
   ./scripts/download_qwen3_models.sh
   record "Qwen3 ASR + ForcedAligner weights in third_party/models/"
+  step "Downloading the speaker-similarity model (~390MB)"
+  ./scripts/download_speaker_id.sh
+  record "wavlm-base-plus-sv in third_party/models/speaker-id/ (converted to safetensors)"
 else
   warn "skipping model download"
 fi
@@ -153,17 +185,7 @@ else
   warn "skipping VocalSound download"
 fi
 
-# ── 6 · MFA (optional) ───────────────────────────────────────────────────────
-if [ "$WITH_MFA" = 1 ]; then
-  step "Bootstrapping Montreal Forced Aligner (slow)"
-  $PY -m para_synth.cli setup-mfa || warn "MFA setup failed — the Qwen3/MMS aligners still work"
-else
-  echo
-  echo "ⓘ Skipping MFA (pass --with-mfa to include it). The Qwen3 forced aligner is tried"
-  echo "  first and needs no conda, so MFA is optional."
-fi
-
-# ── 7 · .env ─────────────────────────────────────────────────────────────────
+# ── 6 · .env ─────────────────────────────────────────────────────────────────
 step "Checking API key file"
 if [ -f .env ]; then
   ok ".env exists"
@@ -173,7 +195,7 @@ else
   warn "running 'para-synth tag-transcripts'"
 fi
 
-# ── 8 · Verify ───────────────────────────────────────────────────────────────
+# ── 7 · Verify ───────────────────────────────────────────────────────────────
 step "Environment check"
 $PY -m para_synth.cli doctor || warn "doctor reported issues (see docs/PIPELINE.md 'Gotchas')"
 

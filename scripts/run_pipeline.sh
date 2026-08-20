@@ -9,7 +9,6 @@ para-synth doctor
 # ./scripts/download_vocalsound.sh
 # ./scripts/download_qwen3_models.sh
 # para-synth setup-seedvc
-# para-synth setup-mfa          # optional — qwen3 is tried first, see configs/default.yaml
 
 # Only needed if data/raw/audio/ has clips with no data/raw/transcripts/{id}.txt yet:
 # para-synth transcribe
@@ -25,3 +24,12 @@ para-synth build-manifest --tagged
 para-synth run --limit 5
 
 para-synth inspect
+
+# `run` chains three stages that can also be run one at a time. Each skips rows it has
+# already done, so re-tuning a splice or a quality threshold doesn't re-pay for the stage
+# before it (add --force to redo, --limit N to cap; see "Staged execution" in
+# docs/PIPELINE.md):
+#
+#   para-synth align     # 1. where each [tag] belongs in time -> data/work/stages/align.jsonl
+#   para-synth synth     # 2. convert + splice            -> para_*.wav + metadata_synth.jsonl
+#   para-synth filter    # 3. NISQA quality gate          -> metadata_filtered.jsonl

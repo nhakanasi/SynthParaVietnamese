@@ -4,9 +4,11 @@ README.md for the recommended run order and docs/PIPELINE.md for what each stage
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
-from para_synth.config import Config, load_config
+from para_synth.config import REPO_ROOT, Config, load_config
 
 
 def cmd_doctor(args, cfg: Config) -> None:
@@ -25,12 +27,6 @@ def cmd_setup_seedvc(args, cfg: Config) -> None:
     from para_synth.seedvc import setup_seedvc
 
     setup_seedvc(cfg.seedvc.repo_dir)
-
-
-def cmd_setup_mfa(args, cfg: Config) -> None:
-    from para_synth.align.mfa import MFAAligner
-
-    MFAAligner(cfg.alignment).setup()
 
 
 def cmd_transcribe(args, cfg: Config) -> None:
@@ -67,28 +63,94 @@ def cmd_tag_transcripts(args, cfg: Config) -> None:
     print(f"✅ tagged {n_ok}/{len(rows)} transcripts -> {cfg.paths.tagged_transcript_dir}")
 
 
-def cmd_build_manifest(args, cfg: Config) -> None:
-    from para_synth.dataset import build_manifest, tagged_rows
+def _manifest_rows(cfg: Config, tagged: bool = True):
+    """Every row the pipeline can see, from whichever input source the config selects.
 
-    transcript_dir = cfg.paths.tagged_transcript_dir if args.tagged else cfg.paths.raw_transcript_dir
-    rows = build_manifest(cfg.paths.raw_audio_dir, transcript_dir)
-    if args.tagged:
+    `paths.manifest` wins when it's set: a corpus that ships its own JSONL manifest carries
+    the transcript inside it, so there is no separate transcript directory to choose
+    between, and `tagged` doesn't apply.
+    """
+    from para_synth.dataset import build_manifest, read_manifest_jsonl
+
+    if cfg.paths.manifest:
+        return read_manifest_jsonl(cfg.paths.manifest)
+    transcript_dir = cfg.paths.tagged_transcript_dir if tagged else cfg.paths.raw_transcript_dir
+    return build_manifest(cfg.paths.raw_audio_dir, transcript_dir)
+
+
+def cmd_build_manifest(args, cfg: Config) -> None:
+    from para_synth.dataset import tagged_rows
+
+    rows = _manifest_rows(cfg, tagged=args.tagged)
+    if args.tagged or cfg.paths.manifest:
         rows = tagged_rows(rows)
         print(f"🏷️  {len(rows)} rows carry an inline tag")
 
 
-def cmd_run(args, cfg: Config) -> None:
-    from para_synth.dataset import build_manifest, tagged_rows
-    from para_synth.pipeline import synthesize_batch
+def cmd_export(args, cfg: Config) -> None:
+    from para_synth.dataset import read_jsonl, read_manifest_jsonl, write_manifest_jsonl
 
-    rows = build_manifest(cfg.paths.raw_audio_dir, cfg.paths.tagged_transcript_dir)
-    rows = tagged_rows(rows)
+    src = cfg.paths.output_dir / "metadata_filtered.jsonl"
+    rows = read_jsonl(src)
+    if not rows:
+        print(f"❌ no rows in {src} — run `para-synth filter` first")
+        sys.exit(1)
+
+    # Only consulted for the columns this pipeline doesn't interpret (`lang`,
+    # `dataset_name`, …); without an input manifest there are none to carry through.
+    source_rows = (
+        {r.id: r for r in read_manifest_jsonl(cfg.paths.manifest)} if cfg.paths.manifest else {}
+    )
+    out = Path(args.out) if args.out else cfg.paths.output_dir / "manifest.jsonl"
+    write_manifest_jsonl(out, rows, source_rows)
+
+
+def _tagged_manifest(args, cfg: Config):
+    """The tagged rows the synthesis stages operate on, honouring --limit."""
+    from para_synth.dataset import tagged_rows
+
+    rows = tagged_rows(_manifest_rows(cfg))
     if args.limit:
         rows = rows[: args.limit]
     if not rows:
-        print("❌ no tagged rows to synthesize — run `para-synth tag-transcripts` first")
+        if cfg.paths.manifest:
+            print(f"❌ no rows in {cfg.paths.manifest} carry an inline [tag] in their "
+                  "`text` — nothing to synthesize.")
+        else:
+            print("❌ no tagged rows to synthesize — run `para-synth tag-transcripts` first")
         sys.exit(1)
-    synthesize_batch(rows, cfg, language=cfg.asr.language)
+    return rows
+
+
+def cmd_align(args, cfg: Config) -> None:
+    from para_synth.pipeline import align_batch
+
+    align_batch(_tagged_manifest(args, cfg), cfg, language=cfg.asr.language, force=args.force)
+
+
+def cmd_synth(args, cfg: Config) -> None:
+    from para_synth.pipeline import synthesize_batch
+
+    synthesize_batch(_tagged_manifest(args, cfg), cfg, force=args.force)
+
+
+def cmd_filter(args, cfg: Config) -> None:
+    from para_synth.pipeline import filter_batch
+
+    filter_batch(cfg, force=args.force)
+
+
+def cmd_run(args, cfg: Config) -> None:
+    from para_synth.pipeline import align_batch, filter_batch, filter_is_configured, synthesize_batch
+
+    rows = _tagged_manifest(args, cfg)
+    align_batch(rows, cfg, language=cfg.asr.language, force=args.force)
+    synthesize_batch(rows, cfg, force=args.force)
+    if filter_is_configured(cfg):
+        filter_batch(cfg, force=args.force)
+    else:
+        print("⏭️  skipping the filter stage: quality.nisqa.enabled is false and "
+              "quality.max_boundary_activity is null, so there is nothing to filter on")
 
 
 def cmd_inspect(args, cfg: Config) -> None:
@@ -122,7 +184,6 @@ def build_parser() -> argparse.ArgumentParser:
     dl.set_defaults(func=cmd_download_vocalsound)
 
     sub.add_parser("setup-seedvc", help="clone + install Seed-VC").set_defaults(func=cmd_setup_seedvc)
-    sub.add_parser("setup-mfa", help="bootstrap Montreal Forced Aligner + vietnamese_mfa").set_defaults(func=cmd_setup_mfa)
 
     tr = sub.add_parser("transcribe", help="Qwen3-ASR any raw audio missing a transcript")
     tr.add_argument("--overwrite", action="store_true")
@@ -136,9 +197,26 @@ def build_parser() -> argparse.ArgumentParser:
     mf.add_argument("--tagged", action="store_true", help="use data/tagged/transcripts instead of data/raw/transcripts")
     mf.set_defaults(func=cmd_build_manifest)
 
-    run = sub.add_parser("run", help="run the full synthesis pipeline over tagged rows")
-    run.add_argument("--limit", type=int, default=None, help="only process the first N rows (sanity-check)")
-    run.set_defaults(func=cmd_run)
+    ex = sub.add_parser("export", help="write the rows that passed the filter as a JSONL manifest")
+    ex.add_argument("--out", default=None, help="output path (default: <output_dir>/manifest.jsonl)")
+    ex.set_defaults(func=cmd_export)
+
+    # The synthesis stages, in order. Each one persists what it produced and skips rows it
+    # has already done, so they can be run individually and re-run cheaply; `run` chains
+    # all three. See "Staged execution" in docs/PIPELINE.md.
+    for name, help_text, func, takes_limit in (
+        ("align", "stage 1: find each transcript tag's insertion time -> stages/align.jsonl", cmd_align, True),
+        ("synth", "stage 2: convert + splice each row -> metadata_synth.jsonl", cmd_synth, True),
+        # `filter` reads metadata_synth.jsonl rather than the manifest, so it has no --limit:
+        # what it covers is whatever `synth` has produced so far.
+        ("filter", "stage 3: quality-check the finished recordings -> metadata_filtered.jsonl", cmd_filter, False),
+        ("run", "run all three synthesis stages over tagged rows", cmd_run, True),
+    ):
+        sp = sub.add_parser(name, help=help_text)
+        if takes_limit:
+            sp.add_argument("--limit", type=int, default=None, help="only process the first N rows (sanity-check)")
+        sp.add_argument("--force", action="store_true", help="redo rows this stage has already done")
+        sp.set_defaults(func=func)
 
     insp = sub.add_parser("inspect", help="print the worst-scoring rows from the last run")
     insp.add_argument("--limit", type=int, default=5)
@@ -147,7 +225,28 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _load_dotenv() -> None:
+    """Read repo-root .env into the environment, without adding a dependency.
+
+    `scripts/prepare.sh` creates .env from .env.example and both the README and
+    .env.example tell you to put DASHSCOPE_API_KEY / GEMINI_API_KEY there — but nothing
+    ever read the file, so `tag-transcripts` failed with "DASHSCOPE_API_KEY is not set"
+    even after you followed the instructions. Values already in the environment win, so an
+    explicitly exported key still overrides the file.
+    """
+    env_path = REPO_ROOT / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
 def main(argv: list[str] | None = None) -> None:
+    _load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
     cfg = load_config(args.config) if args.config else load_config()

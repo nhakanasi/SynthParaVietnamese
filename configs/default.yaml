@@ -12,45 +12,61 @@ seedvc:
   # garbage on coughs/sniffs/throat-clearing; only flip to true for laughter
 
 splice:
-  placement: gap # legacy fallback if alignment (MFA/MMS) AND the proportional fallback
+  placement: gap # legacy fallback if alignment (qwen3/MMS) AND the proportional fallback
   # both come back empty: "gap" (longest pause) | "before" | "after"
   para_gain_db: -3.0 # level of the vocalisation vs. speech peak
-  pad_ms: 10 # splice() only: fixed silence either side of the insert, always applied
-  fade_ms: 50 # fade in/out on the insert at the splice point
-  # adaptive_splice() (para_synth.audio_utils) instead of splice(): only fades/widens a
-  # junction's gap when its boundary RMS shows the cut actually landed on active
-  # phonation (a real risk here — the cut point is a forced-aligned word boundary, not a
-  # natural pause) rather than always paying a fixed fade+pad cost regardless.
-  adaptive: false
-  min_pad_ms: 10 # adaptive_splice() bridge width at a boundary that was already quiet
-  max_gap_ms: 70 # adaptive_splice() bridge width at a boundary that needed damping
+  pad_ms: 10 # "fixed" mode only: silence either side of the insert, always applied
+  fade_ms: 50 # fade length at the splice junctions
+  # Which splice implementation joins the event to the speech (para_synth/audio_utils.py):
+  #   tempo    — exponential fades at both junctions + a room-tone gap sized to this
+  #              speaker's own median pause. Default: the forced-aligned cut lands
+  #              mid-phonation in practice (20/20 rows of the first real batch), which
+  #              "fixed" leaves as a hard discontinuity since it never fades the speech.
+  #   adaptive — fade/widen a junction only where its boundary RMS says the cut landed on
+  #              active phonation.
+  #   fixed    — the notebook's original: fixed fade on the insert + fixed pad, regardless.
+  mode: tempo
+  min_pad_ms: 10 # adaptive only: bridge width at a boundary that was already quiet
+  max_gap_ms: 70 # adaptive only: bridge width at a boundary that needed damping
+  gap_scale: 1.0 # tempo only: multiplier on the measured median pause (1.0 = exact tempo)
+  fade_k: 5.0 # tempo only: exponential fade curvature — higher damps faster
 
 selection:
-  # How pick_vocalsound_clip() chooses a clip within the matched VocalSound class.
-  # 0.0 = pure random (every clip equally likely). Higher values bias sampling toward
-  # clips whose loudness is closer to the speaker's own level just before the splice
-  # point — a soft preference, never a hard filter, so a loud laugh from a soft-spoken
-  # speaker still happens sometimes (real people do that) and the dataset keeps the
-  # acoustic variance a Para-TTS model benefits from. ~1.0-2.0 is a moderate bias.
-  energy_weight: 1.0
-  context_s: 2.5 # seconds of speech before the splice point used as the reference level
+  # How pick_vocalsound_clip() (para_synth/selection.py) chooses a clip within the matched
+  # VocalSound class. It matches only on the axes Seed-VC does NOT normalise away — speaker
+  # identity/timbre is excluded on purpose, since conversion already handles that with the
+  # CAM++ style vector. Each axis distance is scaled so ~1.0 is a clearly audible mismatch;
+  # they're summed with these weights into a sampling weight exp(-distance). Soft bias,
+  # never a filter: every usable clip keeps nonzero probability, so a loud laugh from a
+  # soft-spoken speaker still happens sometimes (real people do that) and the dataset keeps
+  # the acoustic variance a Para-TTS model benefits from. All at 0.0 = pure random.
+  energy_weight: 1.0 # intensity: crest+duration rank vs. the speaker's own energy rank
+  clarity_weight: 1.5 # channel: SNR (dB) + effective bandwidth (octaves). Weighted highest
+  # because VocalSound's crowdsourced mics vary far more than its speakers' energy does,
+  # and hiss/band-limiting in the source is reconstructed faithfully by Seed-VC — it is the
+  # mismatch a clean recording rejects most audibly.
+  tempo_weight: 1.0 # timing: envelope rate (octaves). LAUGHTER ONLY — cough/sneeze/
+  # throat-clearing/sniff are reflexes whose rate has no link to speaking rate, so this is
+  # ignored for them whatever it's set to. Note this selects a clip that already fits; it
+  # does not time-stretch one that doesn't (see "Deliberately not implemented").
+  context_s: 2.5 # seconds of speech before the splice point used as the energy/pace reference
+  candidate_pool: 48 # clips loaded and measured per row when any weight is on
+  max_clipping: 0.01 # hard gate (not a match): drop candidates this clipped
 
 sample_rate: 22050 # Seed-VC's base vocoder rate; everything is resampled to this
 
 alignment:
   # Stage order tried by para_synth.align.find_insert_time(), first success wins:
-  #   1. qwen3      — Qwen3-ForcedAligner-0.6B: no pronunciation dictionary needed, so it
-  #                    doesn't hit the MFA "spn" (OOV) problem cell 22 of the notebook was
-  #                    debugging for Vietnamese colloquial fillers/particles. Preferred.
-  #   2. mfa         — Montreal Forced Aligner + vietnamese_mfa (dictionary-based, cell 9-10)
-  #   3. mms         — torchaudio MMS_FA (cell 8's original fallback)
-  #   4. proportional — word-fraction estimate snapped to nearest silence (last resort)
+  #   1. qwen3       — Qwen3-ForcedAligner-0.6B: no pronunciation dictionary needed, so it
+  #                    doesn't hit the dictionary-OOV ("spn") problem cell 22 of the
+  #                    notebook was debugging for Vietnamese colloquial fillers/particles.
+  #                    Preferred, and it resolves every row in practice.
+  #   2. mms         — torchaudio MMS_FA (cell 8's original fallback), acoustic backstop
+  #   3. proportional — word-fraction estimate snapped to nearest silence (last resort)
+  # Montreal Forced Aligner was removed: it needed a conda/Kaldi env nothing else here uses,
+  # and its vietnamese_mfa dictionary marks the particles this pipeline splices around as
+  # OOV. See "Alignment stage order" in docs/PIPELINE.md.
   use_qwen3: true
-  use_mfa: true
-  mfa_env_name: aligner
-  mfa_acoustic_model: vietnamese_mfa # covers Hanoi + Ho Chi Minh City dialects
-  mfa_dictionary: vietnamese_mfa
-  conda_dir: third_party/miniforge3 # only used if no conda is found at all
 
 models:
   # third_party/models/ is laid out by pipeline purpose, not by vendor — see
@@ -69,12 +85,89 @@ models:
   speaker_id_dir: third_party/models/speaker-id/wavlm-base-plus-sv
   speaker_id_hub_id: microsoft/wavlm-base-plus-sv
 
+quality:
+  # Which speaker encoder scores each conversion (para_synth/quality.py):
+  #   campplus — the same CAM++ encoder Seed-VC v1's inference.py builds its style vector
+  #              from, so sim_converted measures the conversion in the embedding space it
+  #              was actually conditioned on. Needs seedvc.repo_dir to exist.
+  #   wavlm    — microsoft/wavlm-base-plus-sv, an independent verifier. Needs no seed-vc
+  #              checkout, but judges the clone from outside the space it was optimised
+  #              for, so a faithful conversion can still score modestly.
+  speaker_embedder: campplus
+
+  # Splice-junction check, applied by the `filter` stage and needing no model at all.
+  # NISQA below scores the *finished* recording, where tempo_splice has already fade-damped
+  # both junctions and separated them with a room-tone gap — so an event that interrupts the
+  # speaker mid-vowel still reads as a clean signal. This measures the source recording at
+  # the insertion time instead: the ratio of the energy right at the cut to the surrounding
+  # speech's own level (0 = the cut fell in silence, ~1 = it fell on speech as loud as the
+  # segment average). It is the only check here that judges *where* the event went rather
+  # than how the audio came out. A row is judged on the louder of its two junctions.
+  # Forced alignment lands mid-phonation routinely — measured worst-junction activity on
+  # the first 20-row batch spans 0.04 to 1.76, median 0.85 — so this is a threshold that has
+  # to be picked by ear against a real distribution, not derived. 1.2 is where that batch
+  # was judged to stop being acceptable; it rejects 3 rows of 20, where 1.0 would reject 7
+  # and 0.8 would reject 11. Re-listen before reusing it on a different corpus.
+  # null = not checked. Note adaptive_splice's own 0.2 "active" threshold is a different
+  # decision entirely: that is where a junction is worth damping, far below where a row is
+  # worth rejecting.
+  max_boundary_activity: 1.2
+
+  nisqa:
+    # NISQA v2.0 (para_synth/nisqa.py) predicts what a listening panel would score each
+    # finished Para recording, with no reference signal — the check speaker_embedder can't
+    # make, since a cosine between speaker embeddings says nothing about hiss, a step at a
+    # splice junction, or conversion coloration.
+    #
+    # LICENCE: torchmetrics downloads the upstream NISQA weights, which are CC BY-NC-SA 4.0
+    # — NON-COMMERCIAL. Fine for research and internal dataset triage; do not ship them in
+    # a product. `enabled: false` means they are never downloaded.
+    enabled: true
+    # Each dimension carries two optional criteria (null = not checked): an absolute floor
+    # on the finished recording, and a cap on how far it fell below the source recording it
+    # was built from. A row passes when every criterion that is set passes. Failing rows are
+    # listed and left out of metadata_filtered.jsonl — nothing is deleted, and everything
+    # measured is cached in data/work/stages/quality.jsonl, so re-tuning any threshold below
+    # costs no model time at all. `loudness` has no threshold: the pipeline peak-normalises
+    # its output, so a loudness difference measures that, not the splice.
+    #
+    # The drops are the load-bearing criteria. An absolute floor mostly measures how clean
+    # the input corpus was; the drop measures what this pipeline did to it, which is the
+    # question worth asking and the one that survives a uniformly noisy or uniformly clean
+    # corpus. Same relative-measure reasoning as the selection axes above. Measured spread
+    # on the first 20-row batch: see docs/PIPELINE.md ("NISQA filtering").
+    min_mos: null # overall quality, 1-5
+    max_mos_drop: 0.5 # measured drops spanned -0.11..+0.59; this rejects the one outlier,
+    # and the gap between that outlier and the next value is wide enough that anything from
+    # 0.40 to 0.55 filters identically.
+    min_noisiness: null # hiss/background noise — a mismatched VocalSound microphone
+    max_noisiness_drop: null
+    min_discontinuity: null # isolated interruptions — the dimension a bad splice moves
+    max_discontinuity_drop: 0.22 # measured drops spanned -0.28..+0.43, median +0.11. Set
+    # well inside the distribution rather than at its outlier: this is the dimension that
+    # scores a seam at the splice specifically, so it is the one worth being strict on, and
+    # 0.22 is where the batch was judged by ear to stop being acceptable. Re-listen before
+    # reusing it on a different corpus.
+    min_coloration: null # timbral distortion — Seed-VC's own footprint
+    max_coloration_drop: null
+
 paths:
+  # Where rows come from. Two mutually exclusive sources:
+  #   manifest — a JSONL file, one {"audio_filepath": ..., "text": ...} object per line,
+  #              audio paths relative to the manifest's own directory. This is the format a
+  #              corpus normally arrives in, its `text` usually already carries the [tag],
+  #              and `para-synth export` writes the finished rows back out in the same
+  #              shape (extra columns like lang/dataset_name carried through untouched).
+  #   the raw_/tagged_ directories below — audio paired with a transcript of the same
+  #              filename stem, for a corpus assembled by hand. Used when manifest is null.
+  # manifest: data/raw/sample_clean/metadata.jsonl
+  manifest: null
   raw_audio_dir: data/raw/audio
   raw_transcript_dir: data/raw/transcripts
   tagged_transcript_dir: data/tagged/transcripts
   vocalsound_dir: data/vocalsound/audio_16k
-  work_dir: data/work # scratch: intermediate Seed-VC outputs, MFA corpora, etc.
+  work_dir: data/work # scratch: source/converted VocalSound clips, Seed-VC output, etc.
+  stage_dir: data/work/stages # per-stage resume artifacts: align.jsonl, quality.jsonl
   output_dir: data/output/default_run
 
 asr:
