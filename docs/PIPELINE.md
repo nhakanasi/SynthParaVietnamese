@@ -21,7 +21,8 @@ Transcription ──► Qwen/Gemini (add tag) ───────────�
 | (which clip of that class — implicit) | `para_synth/selection.py` | matches the axes Seed-VC does *not* regenerate; see "Clip selection" below |
 | Speech recording | `para_synth/dataset.py` | `data/raw/audio/{id}.wav`, or a row of the JSONL manifest `paths.manifest` names |
 | Transcription | `para_synth/dataset.py`, `para_synth/asr.py` | `data/raw/transcripts/{id}.txt`; `asr.py` fills gaps for audio-only input |
-| Qwen/Gemini (add tag) | `para_synth/tagging.py` | writes `data/tagged/transcripts/{id}.txt` |
+| (candidate positions — implicit) | `para_synth/slots.py`, `para_synth/vad.py` | the pauses each recording offers, as positions in its transcript; see "Slot-constrained tag placement" below |
+| Qwen/Gemini (add tag) | `para_synth/tagging.py` | writes `data/tagged/transcripts/{id}.txt`, choosing one of those positions |
 | SeedVC v1 | `para_synth/seedvc.py` | re-voices the VocalSound clip into the speaker's timbre |
 | (alignment — implicit, needed for "Splice" to be more than a guess) | `para_synth/align/` | qwen3 → mms → proportional, first success wins |
 | Splice | `para_synth/audio_utils.py: splice()` | inserts the re-voiced clip at the aligned timestamp |
@@ -41,13 +42,15 @@ alignment is one forward pass per row, synthesis is 50 diffusion steps per row (
 | stage | command | reads | writes |
 |---|---|---|---|
 | asr *(optional)* | `para-synth transcribe` | `data/raw/audio/` | `data/raw/transcripts/{id}.txt` |
-| tag | `para-synth tag-transcripts` | raw transcripts | `data/tagged/transcripts/{id}.txt` |
-| align | `para-synth align` | tagged manifest | `data/work/stages/align.jsonl` — `{id, insert_at_s, insert_stage}` |
+| slots | `para-synth slots` | raw transcripts + audio | `stages/slots.jsonl` — `{id, candidates: [{i, time_s, pause_s, char_offset, before, after}]}` |
+| tag | `para-synth tag-transcripts` | `slots.jsonl` + audio | `data/tagged/transcripts/{id}.txt` + `stages/tagged.jsonl` — `{id, tag, slot_i, insert_at_s, pause_s}` |
+| align | `para-synth align` | tagged manifest, `tagged.jsonl` | `data/work/stages/align.jsonl` — `{id, insert_at_s, insert_stage}` |
 | synth | `para-synth synth` | `align.jsonl` | `para_{id}.wav` + `metadata_synth.jsonl` |
 | filter | `para-synth filter` | `metadata_synth.jsonl` | `stages/quality.jsonl` + `metadata_filtered.jsonl` |
 | export | `para-synth export` | `metadata_filtered.jsonl` | `manifest.jsonl` — the passing rows in the caller's own JSONL shape |
 
-`para-synth run` runs align → synth → filter, skipping filter when it has no criteria
+`slots` and `tag` apply only to untagged input; a JSONL manifest that already carries its
+`[tag]` inline starts at `align`. `para-synth run` runs align → synth → filter, skipping filter when it has no criteria
 configured at all (`quality.nisqa.enabled: false` *and* `quality.max_boundary_activity:
 null`). The first two stages take `--limit N`; all of them take `--force` to redo rows
 they've already done.
@@ -170,9 +173,47 @@ no guarantee of a genuine pause where it belongs. Only stage 3 snaps to a nearby
 internally, since it has no acoustic grounding to begin with. What every stage's output then
 passes through is the VAD pause check below.
 
+## Slot-constrained tag placement
+
+`para_synth/slots.py` and the `slots` stage, for input that arrives untagged.
+
+Where the tag goes in the transcript and where the cut goes in the audio are the same
+decision, so the pipeline makes it once. `slots` runs pause detection (`vad.pause_intervals`)
+and the forced aligner's word table over the *untagged* transcript, keeps the pauses that fall
+in a gap between two aligned words, and writes them out as numbered candidate positions. The
+tagger then shows the model the transcript with `<1>`, `<2>` … at exactly those positions,
+plays it the recording, and accepts only `{"slot": N, "tag": "..."}`; the tagged text is built
+locally by inserting `[tag]` at that slot's character offset, never echoed back by the model.
+`align` reads the chosen slot's time straight out of `stages/tagged.jsonl` — the aligner does
+not run a second time, and no snapping is needed, because the cut sits in a measured pause by
+construction.
+
+This is SynParaSpeech's ordering (arXiv:2509.14946), which segments with VAD first and has the
+LLM insert the tag "at the boundary of relevant text segments" — and is why that paper needs
+no crossfade or smoothing anywhere.
+
+Measured on the 20-row batch: 16 rows offer at least one position (47 in total, median 2 per
+row, pause widths 0.20–1.20s) and 4 offer none. Those 4 are **skipped** rather than tagged
+freely, which is the whole point — every delivered row is then spliced into real silence, at a
+~20% yield cost on a corpus of near-continuous podcast speech. Set
+`tagging.slot_constrained: false` for the old free-placement behaviour.
+
+Two things fail closed, because a wrong character offset would put the tag between different
+words than the audio cut falls between:
+
+- The aligner tokenizes internally and drops tokens that clean to nothing. These Vietnamese
+  transcripts contain standalone `,` tokens, so the aligner's word index is *not* the
+  transcript's token index. `map_words_to_tokens()` walks both and returns `None` the moment a
+  real word fails to line up; the row then offers no slots and is skipped.
+- Only the qwen3 backend produces a word table. MMS returns a single boundary and the
+  proportional fallback has no acoustic grounding, so both yield no slots at all.
+
 ## VAD pause snapping
 
-`para_synth/vad.py`, applied to every aligned time in the `align` stage.
+`para_synth/vad.py: snap_insert_time()`, applied to every aligned time in the `align` stage.
+This is the *repair* path, and it now runs only for input that arrives pre-tagged, where the
+tag's position was decided upstream and the slot stage above has nothing to constrain. Rows
+that came through `slots` skip it entirely.
 
 A word boundary is not a pause. In connected speech the join between two words is usually
 continuous phonation, so the aligned cut lands mid-voice routinely — measured worst-junction
@@ -219,9 +260,12 @@ activity to 0.01) and a no-op where one doesn't, with `quality.max_boundary_acti
 judging the rows that stayed put. Set `skip` only when a mid-utterance splice is unacceptable
 and yield doesn't matter — check the `no_pause` count in the align summary first.
 
-The deeper fix isn't a bigger shift budget: it's choosing the tag's *position in the
-transcript* to coincide with a pause in the first place, rather than placing it from text and
-then dragging the audio edit toward silence. See "Deliberately not implemented".
+A full run with VAD enabled confirmed the arithmetic: `no_pause=19, snapped=1`, and the one
+row that snapped landed back on the time the aligner had already chosen — a net effect of zero
+on all 20 rows. The fix isn't a bigger shift budget, it's choosing the tag's *position in the
+transcript* to coincide with a pause in the first place instead of placing it from text and
+then dragging the audio edit toward silence. That is what "Slot-constrained tag placement"
+above does, and why this section applies only to pre-tagged input.
 
 ### Why Montreal Forced Aligner was removed
 
@@ -461,18 +505,6 @@ than a core dependency for exactly that reason.
 A few DSP/selection ideas were considered and rejected — noted here so they don't get
 re-proposed or "fixed in" without re-litigating the reasoning:
 
-- **Pause-aware tag placement** (not rejected — *not built yet*, and the natural successor to
-  VAD pause snapping). Today the order is: LLM picks a tag position from the transcript →
-  forced alignment turns that into a time → VAD tries to drag that time onto a pause. The
-  measurement in "VAD pause snapping" shows why that last step mostly can't fire: in
-  near-continuous speech the chosen position simply isn't near a pause (median 2.02s away).
-  Inverting it would fix the cause rather than the symptom — detect pauses first, then have
-  the tagger place the tag at the word boundary that *already* coincides with one, so
-  position and pause agree by construction and no shift is needed. `qwen_omni_audio` is
-  partway there (it hears the recording, and its prompt asks for a position where the speaker
-  pauses), but nothing constrains its answer to a detected pause. Touches `tagging.py` and the
-  align stage together, so it was left as a deliberate next step rather than bolted on.
-
 - **Mel-spectrogram + neural-vocoder (HiFi-GAN) resynthesis of the stitched waveform** at
   the splice step — see "Splicing: fixed vs. adaptive vs. tempo" above. Regenerates the entire
   recording's phase, not just the two junctions; works against the goal of leaving the
@@ -513,10 +545,17 @@ re-proposed or "fixed in" without re-litigating the reasoning:
 
 - **Text-only** (`qwen`, `gemini`) — the default. Sends just the transcript; the model
   infers which paralinguistic event fits from wording alone.
-- **Audio-conditioned** (`qwen_omni_audio`) — opt-in. Also sends the recording, so tag
-  choice *and* placement can follow the actual delivery: a sigh after a slow, breathy
-  phrase, positioned where the speaker really draws breath rather than wherever the text
-  suggests. Uses `qwen3-omni-flash` over DashScope's OpenAI-compatible endpoint.
+- **Audio-conditioned** (`qwen_omni_audio`) — also sends the recording, so tag choice *and*
+  placement can follow the actual delivery: a sigh after a slow, breathy phrase, positioned
+  where the speaker really draws breath rather than wherever the text suggests. Uses
+  `qwen3-omni-flash` over DashScope's OpenAI-compatible endpoint.
+
+Placement comes in two modes, independent of the backend choice above. **Free placement** lets
+the model return the whole transcript with a `[tag]` inserted wherever it likes.
+**Slot-constrained** placement (`tagging.slot_constrained: true`, the default) offers it only
+the pause positions the `slots` stage found and takes back just an index — see
+"Slot-constrained tag placement" above. Slot-constrained placement needs the audio backend,
+since a numbered position is only meaningful to a model that can hear which pause it names.
 
 Two DashScope quirks the audio path has to honour, both required for the Omni models:
 the request **must be streamed** (a non-streamed call is rejected), and `modalities=["text"]`
@@ -529,10 +568,11 @@ not the default. Gemini's audio input is deliberately *not* wired up: Google's a
 state Gemini "can only infer responses to English-language speech," which was not verified
 either way for Vietnamese — so only the Qwen path is implemented for now.
 
-Whichever backend runs, the output goes through the same mechanical check
-(`_extract_single_tag`): exactly one bracketed tag, drawn from `VS_CLASSES`, and stripping
-it back out must reproduce the input transcript exactly. Audio conditioning changes *which*
-tag is chosen, never the guarantee that nothing else was altered.
+Free placement puts the output through a mechanical check (`_extract_single_tag`): exactly one
+bracketed tag, drawn from `VS_CLASSES`, and stripping it back out must reproduce the input
+transcript exactly. Audio conditioning changes *which* tag is chosen, never the guarantee that
+nothing else was altered. Slot-constrained placement doesn't need that check — the model never
+returns text, so `insert_tag_at()` makes the same guarantee structurally.
 
 ## Clip selection: match what Seed-VC leaves behind
 

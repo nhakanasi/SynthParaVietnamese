@@ -180,6 +180,18 @@ def _measurement_is_current(cached: dict, row: dict, need_nisqa: bool) -> bool:
     return stamp is not None and stamp == _file_stamp(cached.get("para_audio"))
 
 
+def slots_path(cfg: Config) -> Path:
+    return cfg.paths.stage_dir / "slots.jsonl"
+
+
+def tagged_path(cfg: Config) -> Path:
+    """Which pause each row's tag was placed in. Distinct from the tagged transcripts
+    themselves (`data/tagged/transcripts/`, the human-readable artifact) because the time is
+    what `align_batch()` needs and re-deriving it from the text would put us back to
+    guessing at a position that was already decided."""
+    return cfg.paths.stage_dir / "tagged.jsonl"
+
+
 def align_path(cfg: Config) -> Path:
     return cfg.paths.stage_dir / "align.jsonl"
 
@@ -205,6 +217,163 @@ def filtered_path(cfg: Config) -> Path:
     return cfg.paths.output_dir / "metadata_filtered.jsonl"
 
 
+def slots_batch(
+    rows: list[ManifestRow],
+    cfg: Config,
+    language: str | None = "Vietnamese",
+    force: bool = False,
+) -> list[dict]:
+    """Stage 0a: the pauses each recording offers as insertion positions.
+
+    Runs VAD and forced alignment over *untagged* transcripts and writes the intersection —
+    every pause that falls in a gap between two aligned words, with the character offset in
+    the transcript it corresponds to — to `stages/slots.jsonl`. See para_synth/slots.py for
+    why the pipeline finds positions before choosing one rather than the other way round.
+
+    A row with no qualifying pause gets an empty candidate list rather than being omitted:
+    "measured, and there is nowhere to put it" is a different fact from "not measured yet",
+    and only the first should survive a re-run without `--force`.
+    """
+    from para_synth.slots import candidate_slots
+    from para_synth.vad import pause_intervals
+
+    cfg.ensure_dirs()
+    out_path = slots_path(cfg)
+    cached = read_jsonl(out_path)
+    done = {r["id"] for r in cached}
+    todo = list(rows) if force else [r for r in rows if r.id not in done]
+
+    if not todo:
+        print(f"⏭️  all {len(rows)} rows already have candidate slots -> {out_path}")
+        return cached
+
+    align_pipeline = AlignmentPipeline(cfg.alignment, cfg.models)
+    fresh: list[dict] = []
+    n_empty = 0
+    for i, row in enumerate(todo, 1):
+        print(f"\n[{i}/{len(todo)}] {row.id}")
+        try:
+            wav, sr = load_mono(row.audio_filepath)
+            pauses = pause_intervals(
+                wav, sr,
+                backend=cfg.vad.backend,
+                merge_gap_s=cfg.vad.merge_gap_s,
+                min_pause_s=cfg.vad.min_pause_s,
+                edge_margin_s=cfg.vad.edge_margin_s,
+            )
+            words = align_pipeline.word_times(row.audio_filepath, row.text, language=language)
+            slots = candidate_slots(row.text, words, pauses) if words else []
+            if not slots:
+                n_empty += 1
+                reason = "alignment unavailable" if not words else f"{len(pauses)} pause(s), none between two words"
+                print(f"   🚫 no candidate positions ({reason})")
+            else:
+                print(f"   🔇 {len(slots)} candidate position(s): "
+                      + ", ".join(f"<{s.i}> {s.before}|{s.after} @{s.time_s:.2f}s ({s.pause_s:.2f}s)"
+                                  for s in slots[:6])
+                      + (" …" if len(slots) > 6 else ""))
+            fresh.append({"id": row.id, "candidates": [asdict(s) for s in slots]})
+        except Exception as e:
+            print(f"   ⚠️  skipped {row.id}: {type(e).__name__}: {e}")
+
+    merged = merge_by_id(cached, fresh)
+    write_jsonl(out_path, merged)
+    n_slots = sum(len(r["candidates"]) for r in merged)
+    print(f"\n🔇 {len(fresh)}/{len(todo)} rows measured, {n_slots} candidate positions "
+          f"({len(merged)} rows total) -> {out_path}")
+    if n_empty:
+        print(f"   {n_empty} row(s) have no pause to insert into and will be skipped by "
+              f"`tag-transcripts` — lower vad.min_pause_s to offer more, at the cost of "
+              f"offering stop closures as if they were pauses")
+    return merged
+
+
+def tag_batch(rows: list[ManifestRow], cfg: Config, force: bool = False) -> list[dict]:
+    """Stage 0b: choose one position and one tag per row, and write the tagged transcript.
+
+    Slot-constrained (`tagging.slot_constrained`, the default): the model hears the recording,
+    sees only the pause positions `slots_batch()` found, and answers with a slot number and a
+    tag. The transcript is then written locally by `slots.insert_tag_at()`, so the text and
+    the eventual splice time are the same decision rather than two that have to be
+    reconciled. Rows with no candidate position are skipped.
+
+    Free (`slot_constrained: false`): the historical path, where the model returns the
+    transcript with a tag woven in wherever it chose. Kept because it needs no VAD, no
+    aligner and no audio-capable model — but its position is unconstrained, which is what
+    `quality.max_boundary_activity` then spends its time rejecting.
+    """
+    from para_synth.slots import slot_from_dict
+    from para_synth.tagging import NoSuitableSlot, TaggingError, choose_slot, insert_para_tag
+
+    cfg.ensure_dirs()
+    cfg.paths.tagged_transcript_dir.mkdir(parents=True, exist_ok=True)
+    out_path = tagged_path(cfg)
+    cached = read_jsonl(out_path)
+    done = {
+        r["id"] for r in cached
+        if (cfg.paths.tagged_transcript_dir / f"{r['id']}.txt").is_file()
+    }
+    todo = list(rows) if force else [r for r in rows if r.id not in done]
+    if not todo:
+        print(f"⏭️  all {len(rows)} rows already tagged -> {cfg.paths.tagged_transcript_dir}")
+        return cached
+
+    slots_by_id = {r["id"]: r["candidates"] for r in read_jsonl(slots_path(cfg))}
+    if cfg.tagging.slot_constrained and not slots_by_id:
+        raise FileNotFoundError(
+            f"no candidate positions at {slots_path(cfg)} — run `para-synth slots` first, or "
+            f"set tagging.slot_constrained: false to let the model place the tag freely"
+        )
+
+    fresh: list[dict] = []
+    n_no_slot = 0
+    for i, row in enumerate(todo, 1):
+        print(f"\n[{i}/{len(todo)}] {row.id}")
+        try:
+            if cfg.tagging.slot_constrained:
+                slots = [slot_from_dict(s) for s in slots_by_id.get(row.id, [])]
+                result = choose_slot(
+                    row.text, slots, row.audio_filepath,
+                    model=cfg.tagging.qwen_omni_audio_model,
+                )
+                slot = slots[result.slot_i - 1]
+                entry = {
+                    "id": row.id,
+                    "tag": result.tag,
+                    "slot_i": result.slot_i,
+                    "insert_at_s": slot.time_s,
+                    "pause_s": slot.pause_s,
+                }
+                print(f"   🏷️  {result.tag} at <{result.slot_i}> {slot.before}|{slot.after} "
+                      f"@{slot.time_s:.2f}s (pause {slot.pause_s:.2f}s)")
+            else:
+                result = insert_para_tag(
+                    row.text,
+                    backend=cfg.tagging.backend,
+                    model=cfg.tagging.model_for_backend(),
+                    audio_path=row.audio_filepath,  # used only by audio backends
+                )
+                entry = {"id": row.id, "tag": result.tag, "slot_i": None, "insert_at_s": None}
+                print(f"   🏷️  {result.tag} (free placement)")
+
+            (cfg.paths.tagged_transcript_dir / f"{row.id}.txt").write_text(result.text, encoding="utf-8")
+            fresh.append(entry)
+        except NoSuitableSlot as e:
+            n_no_slot += 1
+            print(f"   🚫 skipped: {e}")
+        except TaggingError as e:
+            print(f"   ⚠️  tagging failed: {e}")
+
+    merged = merge_by_id(cached, fresh)
+    write_jsonl(out_path, merged)
+    print(f"\n🏷️  {len(fresh)}/{len(todo)} rows tagged ({len(merged)} total) -> "
+          f"{cfg.paths.tagged_transcript_dir}")
+    if n_no_slot:
+        print(f"   {n_no_slot} row(s) had no usable pause position and carry no tag — they "
+              f"drop out of the dataset here rather than being spliced mid-utterance")
+    return merged
+
+
 def align_batch(
     rows: list[ManifestRow],
     cfg: Config,
@@ -216,6 +385,13 @@ def align_batch(
     Writes `{id, insert_at_s, insert_stage}` per row to `stages/align.jsonl`. Rows already
     in that file are skipped unless `force`, which is what makes re-running the rest of the
     pipeline free of the aligner's model load.
+
+    Two ways a row gets its time. If `tag_batch()` placed the tag into a pause it chose, that
+    time is already known exactly and is used as-is — no model runs, and no search can move
+    the splice away from the position the transcript describes. Otherwise the tag arrived
+    from somewhere this pipeline didn't control (a pre-tagged JSONL manifest), so its time
+    has to be recovered by forced alignment and then nudged toward a pause if one is close
+    enough; that is the older path, and `vad.max_shift_s` / `vad.on_no_pause` govern only it.
     """
     cfg.ensure_dirs()
     out_path = align_path(cfg)
@@ -226,6 +402,33 @@ def align_batch(
     if not todo:
         print(f"⏭️  all {len(rows)} rows already aligned -> {out_path}")
         return cached
+
+    chosen = {
+        r["id"]: r for r in read_jsonl(tagged_path(cfg))
+        if r.get("insert_at_s") is not None
+    }
+    from_slots = [r for r in todo if r.id in chosen]
+    todo = [r for r in todo if r.id not in chosen]
+    prechosen = [
+        {
+            "id": row.id,
+            "insert_at_s": chosen[row.id]["insert_at_s"],
+            "insert_stage": "vad_slot",
+            "insert_at_aligned_s": chosen[row.id]["insert_at_s"],
+            "vad_status": "slot",
+            "vad_shift_s": 0.0,
+            "vad_pause_s": chosen[row.id].get("pause_s", 0.0),
+        }
+        for row in from_slots
+    ]
+    if prechosen:
+        print(f"🔇 {len(prechosen)} row(s) were tagged into a pause chosen by "
+              f"`tag-transcripts` — using those times directly, no alignment needed")
+    if not todo:
+        merged = merge_by_id(cached, prechosen)
+        write_jsonl(out_path, merged)
+        print(f"\n🧭 {len(prechosen)} rows resolved ({len(merged)} total) -> {out_path}")
+        return merged
 
     align_pipeline = AlignmentPipeline(cfg.alignment, cfg.models)
     fresh: list[dict] = []
@@ -268,7 +471,7 @@ def align_batch(
         except Exception as e:
             print(f"   ⚠️  skipped {row.id}: {type(e).__name__}: {e}")
 
-    merged = merge_by_id(cached, fresh)
+    merged = merge_by_id(cached, prechosen + fresh)
     write_jsonl(out_path, merged)
     print(f"\n🧭 {len(fresh)}/{len(todo)} rows aligned ({len(merged)} total) -> {out_path}")
     if cfg.vad.enabled and vad_counts:

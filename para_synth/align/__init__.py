@@ -61,6 +61,21 @@ class AlignmentPipeline:
                 self._mms_failed = True
         return self._mms
 
+    def word_times(self, audio_path, text: str, language: str | None = "Vietnamese"):
+        """Every word of `text` with its span in the audio, or None if no backend can
+        produce one.
+
+        Only the Qwen3 backend does: MMS returns a boundary rather than a table, and the
+        proportional fallback has no acoustic grounding at all, so there is nothing
+        trustworthy to hand back. A None here means para_synth.slots finds no candidate
+        positions for the row and the row is skipped — which is the right outcome, since
+        placing an event into "silence" located by a guess is exactly what this replaces.
+        """
+        qwen3 = self._get_qwen3()
+        if qwen3 is None:
+            return None
+        return qwen3.word_times(audio_path, text, language=language)
+
     def find_insert_time(self, row: ManifestRow, wav, sr, language: str | None = "Vietnamese") -> tuple[float, str]:
         qwen3 = self._get_qwen3()
         if qwen3 is not None:

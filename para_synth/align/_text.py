@@ -5,8 +5,40 @@ Ported from notebook45ee5319ae.ipynb cells 8, 10.
 from __future__ import annotations
 
 import unicodedata
+from typing import NamedTuple
 
 from para_synth.dataset import TAG_RE
+
+
+class Word(NamedTuple):
+    """One aligned word and the span of audio it occupies."""
+
+    text: str
+    start: float
+    end: float
+
+
+class Token(NamedTuple):
+    """One whitespace-separated token of a transcript, with where it sits in that string.
+
+    `start`/`end` are character offsets into the original text, which is what lets a time
+    chosen in the audio be turned back into a position in the transcript (para_synth.slots).
+    """
+
+    text: str
+    start: int
+    end: int
+
+
+def token_spans(text: str) -> list[Token]:
+    """Whitespace tokens of `text`, each carrying its character span."""
+    tokens: list[Token] = []
+    pos = 0
+    for tok in text.split():
+        start = text.index(tok, pos)
+        tokens.append(Token(text=tok, start=start, end=start + len(tok)))
+        pos = start + len(tok)
+    return tokens
 
 
 def deaccent_vi(w: str) -> str:

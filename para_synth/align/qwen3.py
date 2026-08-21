@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from para_synth.align._text import words_around_tag
+from para_synth.align._text import Word, words_around_tag
 
 
 class Qwen3Aligner:
@@ -28,6 +28,29 @@ class Qwen3Aligner:
         self.model = Qwen3ForcedAligner.from_pretrained(
             model_source, device_map=device, dtype=torch_dtype
         )
+
+    def word_times(
+        self, audio_path: str | Path, text: str, language: str | None = "Vietnamese"
+    ) -> list[Word] | None:
+        """Align `text` (plain, no `[tag]`) against the audio and return every word with its
+        span, or None if alignment failed.
+
+        This is the aligner's own output, unreduced: `estimate_tag_time()` keeps a single
+        boundary out of it, while para_synth.slots needs the whole table to work out which
+        word gap each VAD pause falls into.
+
+        Note the model tokenizes the text itself, dropping tokens that carry no letters or
+        digits — a standalone "," in these transcripts produces no word here. Callers that
+        need to map words back onto the original string must match on word text rather than
+        assume a position-for-position correspondence; see slots.map_words_to_tokens().
+        """
+        try:
+            results = self.model.align(audio=str(audio_path), text=text, language=language)
+            items = results[0].items if hasattr(results[0], "items") else results[0]
+            return [Word(text=it.text, start=float(it.start_time), end=float(it.end_time)) for it in items]
+        except Exception as e:
+            print(f"      ⚠️  Qwen3 forced-alignment failed for this row ({type(e).__name__}: {e})")
+            return None
 
     def estimate_tag_time(self, audio_path: str | Path, text: str, language: str | None = "Vietnamese") -> float | None:
         """Align only the real words around [tag] (not the bracket annotation itself)
@@ -45,15 +68,11 @@ class Qwen3Aligner:
         if before_words is None:
             return None
 
-        try:
-            transcript = " ".join(before_words + after_words)
-            results = self.model.align(audio=str(audio_path), text=transcript, language=language)
-            items = results[0].items if hasattr(results[0], "items") else results[0]
-
-            n_before = len(before_words)
-            if n_before >= len(items):
-                return None
-            return items[n_before - 1].end_time
-        except Exception as e:
-            print(f"      ⚠️  Qwen3 forced-alignment failed for this row ({type(e).__name__}: {e})")
+        words = self.word_times(audio_path, " ".join(before_words + after_words), language=language)
+        if words is None:
             return None
+
+        n_before = len(before_words)
+        if n_before >= len(words):
+            return None
+        return words[n_before - 1].end

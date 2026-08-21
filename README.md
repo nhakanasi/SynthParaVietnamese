@@ -19,7 +19,7 @@ VocalSound clip  ──►  source  ─┐
 Speech recording ──►  target  ─┘                                              ├─► Para recording
        └──────────────────────────────────────────────────────────────────────┘
 
-Transcript ──► Qwen/Gemini (insert one [tag]) ──► tagged transcript ──────────► new dataset row
+Transcript ──► pauses (VAD) ──► LLM picks one pause + one [tag] ──► tagged transcript ──► new dataset row
 ```
 
 ---
@@ -97,7 +97,8 @@ data/
 │   └── transcripts/      output of `para-synth tag-transcripts`: {id}.txt (has [tag])
 ├── vocalsound/           offline VocalSound copy (from download_vocalsound.sh)
 ├── work/                 scratch: intermediate Seed-VC outputs, converted clips
-│   └── stages/           per-stage resume artifacts: align.jsonl, quality.jsonl
+│   └── stages/           per-stage resume artifacts: slots.jsonl, tagged.jsonl,
+│                         align.jsonl, quality.jsonl
 └── output/<run_name>/    para_{id}.wav + metadata_synth.jsonl (every row, with
                           diagnostics), metadata_filtered.jsonl (the rows that passed the
                           quality gate) and manifest.jsonl (those rows as a deliverable)
@@ -129,7 +130,8 @@ run is just align → synth → filter → export.
 
 ```bash
 para-synth transcribe                 # optional: fill data/raw/transcripts/ via Qwen3-ASR
-para-synth tag-transcripts            # LLM: insert one paralinguistic [tag] per transcript
+para-synth slots                      # find the pauses each recording offers
+para-synth tag-transcripts            # LLM: pick one pause and one paralinguistic [tag] per row
 para-synth build-manifest --tagged    # sanity-check the audio <-> transcript pairing
 para-synth run --limit 5              # synthesize a small batch first
 para-synth inspect                    # review the worst-scoring rows of that batch
@@ -137,6 +139,15 @@ para-synth run                        # drop --limit once the small batch looks 
 ```
 
 `scripts/run_pipeline.sh` is the same sequence as a script.
+
+`slots` and `tag-transcripts` are one decision split in two: `slots` detects where the speaker
+actually pauses and turns each pause into a numbered position in the transcript, then
+`tag-transcripts` plays the recording to the LLM and takes back one position plus one tag. The
+splice therefore lands in real silence by construction, rather than being placed from text and
+repaired afterwards — see "Slot-constrained tag placement" in `docs/PIPELINE.md` for why that
+ordering matters. A row whose recording offers no pause is **skipped** (4 of 20 on the first
+real batch). Both stages are for untagged input only; a manifest that already carries its
+`[tag]` inline starts at `align`.
 
 `run` chains three stages, which also run individually:
 
@@ -148,6 +159,8 @@ para-synth filter     # stage 3: quality gate -> metadata_filtered.jsonl
 
 | stage | reads | writes |
 |---|---|---|
+| `slots` | raw transcripts + audio | `data/work/stages/slots.jsonl` |
+| `tag-transcripts` | `slots.jsonl` + audio | `data/tagged/transcripts/{id}.txt` + `stages/tagged.jsonl` |
 | `align` | the tagged manifest | `data/work/stages/align.jsonl` |
 | `synth` | `align.jsonl` | `para_{id}.wav` + `metadata_synth.jsonl` in the output dir |
 | `filter` | `metadata_synth.jsonl` | `data/work/stages/quality.jsonl` + `metadata_filtered.jsonl` |
@@ -155,8 +168,8 @@ para-synth filter     # stage 3: quality gate -> metadata_filtered.jsonl
 
 Each stage **skips rows it has already done**, so changing a splice or quality setting never
 re-pays for the stage before it — re-splicing costs no alignment, re-filtering costs no
-diffusion. Add `--force` to redo rows anyway; `align`, `synth` and `run` also take
-`--limit N`. The artifact contracts and resume rules are in "Staged execution" in
+diffusion. Add `--force` to redo rows anyway; `slots`, `tag-transcripts`, `align`, `synth` and
+`run` also take `--limit N`. The artifact contracts and resume rules are in "Staged execution" in
 `docs/PIPELINE.md`.
 
 Nothing is ever deleted. Rows that fail the quality gate stay in `metadata_synth.jsonl` with
@@ -433,18 +446,28 @@ Used only by `para-synth transcribe`, for recordings with no transcript yet.
 
 ```yaml
 tagging:
-  backend: qwen                        # qwen | gemini | qwen_omni_audio
+  slot_constrained: true               # offer only the pauses `slots` found
+  backend: qwen                        # only when slot_constrained is false
   qwen_model: qwen-plus
   gemini_model: gemini-2.5-flash
   qwen_omni_audio_model: qwen3-omni-flash
 ```
 
-`qwen` and `gemini` send the transcript text only — cheap, and the default.
-`qwen_omni_audio` also sends the recording, so the model picks a tag and a position that suit
-the actual delivery (a sigh after a slow breathy phrase, placed where the speaker pauses)
-rather than inferring from text alone; it costs more per row and caps audio at 150s. The
-backend you choose determines which API key `.env` needs: `DASHSCOPE_API_KEY` for the Qwen
-backends, `GEMINI_API_KEY` for Gemini.
+`qwen` and `gemini` send the transcript text only — cheap, but they cannot hear the recording.
+`qwen_omni_audio` also sends the audio, so the model picks a tag and a position that suit the
+actual delivery (a sigh after a slow breathy phrase, placed where the speaker pauses) rather
+than inferring from text alone; it costs more per row and caps audio at 150s. The backend you
+choose determines which API key `.env` needs: `DASHSCOPE_API_KEY` for the Qwen backends,
+`GEMINI_API_KEY` for Gemini.
+
+`slot_constrained` decides what the model is allowed to answer, and takes precedence over
+`backend`. Left `true`, the model sees the transcript with `<1>`, `<2>` … marking the pauses
+`para-synth slots` detected and returns only one of those numbers plus a tag; the `[tag]` is
+then inserted by code, and the splice time is that pause. It always goes over
+`qwen_omni_audio` — a numbered pause means nothing to a model that can't hear it — so
+`backend` is consulted only when `slot_constrained` is `false`, which restores the older
+behaviour of inserting the tag anywhere in the text and letting `align` work out afterwards
+what time that corresponds to.
 
 ---
 
@@ -466,7 +489,9 @@ para_synth/            installable package — see docs/PIPELINE.md for what eac
   quality.py             WavLM/CAM++ speaker-similarity QC
   seedvc.py              Seed-VC setup + inference wrapper
   selection.py           which VocalSound clip each row gets
+  slots.py               pauses -> numbered candidate positions in the transcript
   tagging.py             LLM transcript tagging (Qwen/Gemini)
+  vad.py                 pause detection (silero | energy) + the pre-tagged snap path
   vocalsound.py          VocalSound download, indexing, tag->class mapping
 configs/default.yaml     all tunables (section 4 above)
 docs/                    PIPELINE.md (deep-dive) + synthesis.drawio.png (diagram)

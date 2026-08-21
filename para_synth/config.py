@@ -253,6 +253,10 @@ class TaggingConfig:
     qwen_model: str = "qwen-plus"
     gemini_model: str = "gemini-2.5-flash"
     qwen_omni_audio_model: str = "qwen3-omni-flash"
+    # Offer the model only positions VAD found a real pause at (para_synth/slots.py), rather
+    # than letting it place the tag anywhere in the text. Always uses the audio backend, and
+    # requires `para-synth slots` to have run first.
+    slot_constrained: bool = True
 
     def model_for_backend(self) -> str:
         return getattr(self, f"{self.backend}_model")

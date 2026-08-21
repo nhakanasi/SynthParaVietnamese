@@ -18,10 +18,22 @@ Backends behind one interface, matching the diagram's "Qwen/Gemini" label:
                      the text alone suggests. DASHSCOPE_API_KEY. Opt-in: costs more per row
                      than the text-only path and is limited by the model's audio duration
                      cap (150s for qwen3-omni-flash), so `qwen` remains the default.
+
+Two placement modes:
+
+  - **free** (`tagging.slot_constrained: false`) — the model returns the whole transcript
+    with a tag woven in wherever it likes, and `_extract_single_tag()` checks mechanically
+    that nothing else changed. The position is unconstrained, so it usually falls
+    mid-phonation; see para_synth/slots.py for the measurement.
+  - **slot-constrained** (the default) — the model is offered only positions VAD found a
+    real pause at, and answers with `{"slot": N, "tag": "..."}`. It never echoes the
+    transcript; `slots.insert_tag_at()` writes it. Nothing needs verifying because nothing
+    can be altered, and the position is a pause by construction.
 """
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -51,6 +63,23 @@ than mid-phrase. The recording does NOT contain the sound you are adding; you ar
 which one would plausibly belong there.
 """
 
+SLOT_SYSTEM_PROMPT = """You choose where a paralinguistic sound belongs in a recording.
+
+You are given a recording and its transcript. The transcript has numbered markers — <1>, \
+<2>, … — at the points where the speaker actually pauses. These are the only positions \
+available to you.
+
+Listen to the delivery, then choose:
+  - the ONE marker where a paralinguistic sound would most plausibly occur, and
+  - the ONE tag that fits what the speaker is doing there, from this list: {tags}
+
+The recording does NOT already contain the sound; you are deciding which one would belong.
+
+Answer with JSON and nothing else: {{"slot": <marker number>, "tag": "<tag>"}}
+If none of the offered positions would plausibly carry any of these sounds, answer \
+{{"slot": null}}.
+"""
+
 # qwen3-omni-flash accepts up to 150s of audio; longer input is rejected by the API. Guard
 # locally so an over-long file gives a clear error instead of an opaque API failure.
 QWEN_OMNI_MAX_AUDIO_S = 150.0
@@ -60,10 +89,22 @@ class TaggingError(Exception):
     pass
 
 
+class NoSuitableSlot(TaggingError):
+    """The model was offered pause positions and rejected all of them.
+
+    Distinct from the other tagging failures because it is an answer, not a malfunction:
+    retrying will produce the same verdict, and the row should be skipped rather than
+    re-asked.
+    """
+
+
 @dataclass
 class TaggingResult:
     text: str
     tag: str
+    # Which offered pause was chosen, in slot-constrained mode. None on the free path,
+    # where the position came out of the model's own prose and no pause was involved.
+    slot_i: int | None = None
 
 
 def _extract_single_tag(original: str, candidate: str) -> str:
@@ -119,9 +160,8 @@ def _call_gemini(text: str, model: str) -> str:
     return resp.text.strip()
 
 
-def _call_qwen_omni_audio(text: str, model: str, audio_path: str | Path) -> str:
-    """Qwen-Omni with the recording attached, so tag choice/placement can follow the actual
-    delivery rather than the text alone.
+def _qwen_omni_request(system_prompt: str, text: str, model: str, audio_path: str | Path) -> str:
+    """One Qwen-Omni call with the recording attached, shared by both placement modes.
 
     Two API quirks, both required by DashScope for the Omni models: the request must be
     streamed (a non-streamed call is rejected), and `modalities=["text"]` keeps the model
@@ -150,7 +190,7 @@ def _call_qwen_omni_audio(text: str, model: str, audio_path: str | Path) -> str:
     stream = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": AUDIO_SYSTEM_PROMPT.format(tags=", ".join(VS_CLASSES))},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
@@ -171,6 +211,14 @@ def _call_qwen_omni_audio(text: str, model: str, audio_path: str | Path) -> str:
         if event.choices and event.choices[0].delta and event.choices[0].delta.content:
             chunks.append(event.choices[0].delta.content)
     return "".join(chunks).strip()
+
+
+def _call_qwen_omni_audio(text: str, model: str, audio_path: str | Path) -> str:
+    """Free placement with the recording attached, so tag choice/position can follow the
+    actual delivery rather than the text alone."""
+    return _qwen_omni_request(
+        AUDIO_SYSTEM_PROMPT.format(tags=", ".join(VS_CLASSES)), text, model, audio_path
+    )
 
 
 _TEXT_BACKENDS = {"qwen": _call_qwen, "gemini": _call_gemini}
@@ -218,4 +266,71 @@ def insert_para_tag(
         except TaggingError as e:
             last_error = e
             print(f"⚠️  tagging attempt {attempt + 1}/{max_retries + 1} failed: {e}")
+    raise TaggingError(f"gave up after {max_retries + 1} attempts: {last_error}")
+
+
+def _parse_slot_choice(raw: str, n_slots: int) -> tuple[int, str]:
+    """`{"slot": 3, "tag": "laughter"}` -> (3, "laughter").
+
+    Tolerates the model wrapping its JSON in prose or a ```json fence, since that is the
+    common failure and re-asking for it costs another call with the audio attached. Anything
+    else — a slot outside the offered range, a tag outside the vocabulary — raises, and the
+    caller's retry loop asks again.
+    """
+    m = re.search(r"\{.*\}", raw, flags=re.S)
+    if m is None:
+        raise TaggingError(f"no JSON object in the reply: {raw!r}")
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        raise TaggingError(f"reply is not valid JSON ({e}): {raw!r}") from e
+
+    if obj.get("slot") is None:
+        raise NoSuitableSlot("the model rejected every offered pause position")
+
+    slot = obj["slot"]
+    if not isinstance(slot, int) or not 1 <= slot <= n_slots:
+        raise TaggingError(f"slot {slot!r} is not one of 1..{n_slots}")
+
+    tag = str(obj.get("tag", "")).strip().lower().strip("[]")
+    if tag not in VS_CLASSES:
+        raise TaggingError(f"tag {tag!r} is not one of {VS_CLASSES}")
+    return slot, tag
+
+
+def choose_slot(
+    text: str,
+    slots: list,
+    audio_path: str | Path,
+    model: str | None = None,
+    max_retries: int = 2,
+) -> TaggingResult:
+    """Ask the model to pick one of `slots` (para_synth.slots.Slot) and one tag for it, then
+    build the tagged transcript from that choice.
+
+    Always uses the audio backend: the whole point of constraining the position to a real
+    pause is that the model can hear which pause is a breath worth filling and which is a
+    hesitation. Raises NoSuitableSlot when it declines every position, and TaggingError when
+    it fails to answer usably within `max_retries`.
+    """
+    from para_synth.slots import insert_tag_at, render_with_markers
+
+    if not slots:
+        raise NoSuitableSlot("no pause positions were offered")
+    model = model or DEFAULT_MODELS["qwen_omni_audio"]
+    marked = render_with_markers(text, slots)
+    system_prompt = SLOT_SYSTEM_PROMPT.format(tags=", ".join(VS_CLASSES))
+
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            raw = _qwen_omni_request(system_prompt, marked, model, audio_path)
+            slot_i, tag = _parse_slot_choice(raw, len(slots))
+            slot = slots[slot_i - 1]
+            return TaggingResult(text=insert_tag_at(text, slot, tag), tag=f"[{tag}]", slot_i=slot_i)
+        except NoSuitableSlot:
+            raise
+        except TaggingError as e:
+            last_error = e
+            print(f"⚠️  slot choice attempt {attempt + 1}/{max_retries + 1} failed: {e}")
     raise TaggingError(f"gave up after {max_retries + 1} attempts: {last_error}")

@@ -69,7 +69,13 @@ alignment:
   use_qwen3: true
 
 vad:
-  # Keeps the splice out of the middle of an utterance (para_synth/vad.py).
+  # Pause detection. Used by two different things, which is worth keeping straight:
+  #   - `para-synth slots` uses min_pause_s / merge_gap_s / edge_margin_s / backend to
+  #     enumerate the positions the LLM may choose from. This is the primary path.
+  #   - `align` uses max_shift_s / on_no_pause to nudge an ALREADY-PLACED tag toward a pause,
+  #     for rows whose tag this pipeline didn't place (a pre-tagged JSONL manifest). Those
+  #     two settings do nothing on the slots path — there is nothing to snap, the position
+  #     was chosen from pauses to begin with.
   #
   # Forced alignment answers "between which two words does the [tag] go" — but a word
   # boundary in connected speech is usually continuous phonation, not a pause, so the
@@ -224,6 +230,24 @@ asr:
   language: Vietnamese # null -> auto-detect
 
 tagging:
+  # Offer the model only the positions where VAD found a real pause (para_synth/slots.py),
+  # and have it answer with a slot number rather than a rewritten transcript.
+  #
+  # This is the ordering SynParaSpeech (arXiv:2509.14946) uses, and it exists because the
+  # alternative does not work: with free placement the tag lands at a word boundary, which
+  # in connected speech is continuous phonation, and moving the cut afterwards is bounded by
+  # meaning rather than acoustics — 19 of 20 rows on the reference batch had no pause within
+  # reach (see the vad: block). Choosing from pauses in the first place makes the position a
+  # pause by construction, and the tagged text is then written locally from the same choice,
+  # so text position and splice time are one decision instead of two that must agree.
+  #
+  # Requires `para-synth slots` to have run, and always uses the audio backend regardless of
+  # `backend` below: hearing the recording is what separates a breath worth filling from a
+  # hesitation. Rows with no qualifying pause are skipped rather than spliced mid-utterance.
+  # false — the older free-placement path: no VAD, no aligner, no audio model needed, but
+  #         `quality.max_boundary_activity` then spends its time rejecting what it produces.
+  slot_constrained: true
+  # Used when slot_constrained is false:
   # "qwen" / "gemini"    — send the transcript text only (cheap, the default).
   # "qwen_omni_audio"    — also send the recording, so the model picks a tag and a position
   #                        that suit the actual delivery (a sigh after a slow breathy

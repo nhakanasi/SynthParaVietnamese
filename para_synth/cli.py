@@ -37,30 +37,31 @@ def cmd_transcribe(args, cfg: Config) -> None:
                         language=cfg.asr.language, overwrite=args.overwrite)
 
 
-def cmd_tag_transcripts(args, cfg: Config) -> None:
+def _untagged_rows(args, cfg: Config):
+    """The plain, untagged rows the pre-synthesis stages work on, honouring --limit.
+
+    Always the raw transcript directory: `slots` and `tag-transcripts` exist to *produce* a
+    tagged transcript, so a JSONL manifest — which arrives with its tag already inline — has
+    nothing for them to do and goes straight to `align`.
+    """
     from para_synth.dataset import build_manifest
-    from para_synth.tagging import TaggingError, insert_para_tag
 
     rows = build_manifest(cfg.paths.raw_audio_dir, cfg.paths.raw_transcript_dir)
-    cfg.paths.tagged_transcript_dir.mkdir(parents=True, exist_ok=True)
-    n_ok = 0
-    for row in rows:
-        out_path = cfg.paths.tagged_transcript_dir / f"{row.id}.txt"
-        if out_path.is_file() and not args.overwrite:
-            continue
-        try:
-            result = insert_para_tag(
-                row.text,
-                backend=cfg.tagging.backend,
-                model=cfg.tagging.model_for_backend(),
-                audio_path=row.audio_filepath,  # used only by audio backends
-            )
-            out_path.write_text(result.text, encoding="utf-8")
-            print(f"🏷️  {row.id}: {result.tag} -> {out_path.name}")
-            n_ok += 1
-        except TaggingError as e:
-            print(f"⚠️  {row.id}: tagging failed: {e}")
-    print(f"✅ tagged {n_ok}/{len(rows)} transcripts -> {cfg.paths.tagged_transcript_dir}")
+    if getattr(args, "limit", None):
+        rows = rows[: args.limit]
+    return rows
+
+
+def cmd_slots(args, cfg: Config) -> None:
+    from para_synth.pipeline import slots_batch
+
+    slots_batch(_untagged_rows(args, cfg), cfg, language=cfg.asr.language, force=args.force)
+
+
+def cmd_tag_transcripts(args, cfg: Config) -> None:
+    from para_synth.pipeline import tag_batch
+
+    tag_batch(_untagged_rows(args, cfg), cfg, force=args.overwrite)
 
 
 def _manifest_rows(cfg: Config, tagged: bool = True):
@@ -189,8 +190,14 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--overwrite", action="store_true")
     tr.set_defaults(func=cmd_transcribe)
 
-    tag = sub.add_parser("tag-transcripts", help="LLM: insert a paralinguistic [tag] into each transcript")
-    tag.add_argument("--overwrite", action="store_true")
+    sl = sub.add_parser("slots", help="stage 0a: find the pauses each recording offers -> stages/slots.jsonl")
+    sl.add_argument("--limit", type=int, default=None, help="only process the first N rows (sanity-check)")
+    sl.add_argument("--force", action="store_true", help="redo rows this stage has already done")
+    sl.set_defaults(func=cmd_slots)
+
+    tag = sub.add_parser("tag-transcripts", help="stage 0b: LLM picks one pause and one [tag] per row")
+    tag.add_argument("--limit", type=int, default=None, help="only process the first N rows (sanity-check)")
+    tag.add_argument("--overwrite", action="store_true", help="re-tag rows already tagged")
     tag.set_defaults(func=cmd_tag_transcripts)
 
     mf = sub.add_parser("build-manifest", help="preview the audio<->transcript pairing")
