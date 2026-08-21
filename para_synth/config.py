@@ -103,6 +103,19 @@ class AlignmentConfig:
 
 
 @dataclass
+class VADConfig:
+    """Keeps the splice out of the middle of an utterance — see para_synth/vad.py."""
+
+    enabled: bool = True
+    backend: str = "silero"  # "silero" | "energy"
+    min_pause_s: float = 0.12
+    max_shift_s: float = 0.5
+    merge_gap_s: float = 0.10
+    edge_margin_s: float = 0.05
+    on_no_pause: str = "keep"  # "keep" | "skip" — see configs/default.yaml for the measurement
+
+
+@dataclass
 class ModelsConfig:
     """third_party/models/ is laid out by pipeline purpose (asr/, aligner/, conversion/,
     speaker-id/, splicing/) — see third_party/models/README.md. Each `*_source()` helper
@@ -252,6 +265,7 @@ class Config:
     splice: SpliceConfig
     selection: SelectionConfig
     alignment: AlignmentConfig
+    vad: VADConfig
     models: ModelsConfig
     asr: ASRConfig
     quality: QualityConfig
@@ -311,6 +325,7 @@ def load_config(path: str | Path = REPO_ROOT / "configs/default.yaml") -> Config
         splice=SpliceConfig(**raw["splice"]),
         selection=SelectionConfig(**raw.get("selection", {})),
         alignment=AlignmentConfig(use_qwen3=raw["alignment"].get("use_qwen3", True)),
+        vad=VADConfig(**(raw.get("vad") or {})),
         models=ModelsConfig(
             qwen3_asr_dir=_resolve(root, raw["models"]["qwen3_asr_dir"]),
             qwen3_asr_hub_id=raw["models"]["qwen3_asr_hub_id"],

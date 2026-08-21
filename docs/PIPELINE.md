@@ -164,10 +164,64 @@ wins:
    speaking rate, places the tag at the same word-fraction through the audio, then snaps to
    the nearest real silence. Last resort only.
 
-A real alignment result (stages 1–2) is used **as-is** — no silence-snapping — since the tag
-is a post-hoc LLM annotation and there's no guarantee of a genuine pause where it belongs.
-Only stage 3 benefits from snapping to a nearby quiet spot, since it has no acoustic grounding
-to begin with.
+A real alignment result (stages 1–2) is trusted as the *word boundary* it reports — no
+silence-snapping inside the aligner — since the tag is a post-hoc LLM annotation and there's
+no guarantee of a genuine pause where it belongs. Only stage 3 snaps to a nearby quiet spot
+internally, since it has no acoustic grounding to begin with. What every stage's output then
+passes through is the VAD pause check below.
+
+## VAD pause snapping
+
+`para_synth/vad.py`, applied to every aligned time in the `align` stage.
+
+A word boundary is not a pause. In connected speech the join between two words is usually
+continuous phonation, so the aligned cut lands mid-voice routinely — measured worst-junction
+activity on the first real 20-row batch spanned 0.04–1.76 with a **median of 0.85**, i.e. the
+typical cut fell on speech nearly as loud as the segment average. `quality.max_boundary_activity`
+catches that in `filter` and rejects the row; this stage tries to *prevent* it by moving the
+cut onto a real pause first.
+
+Backends (`vad.backend`): `silero` (a trained speech/non-speech classifier — robust exactly
+where an energy threshold misfires, since a breath reads as "not silent" to RMS but "not
+speech" to a VAD, and breaths live in the gaps between utterances; weights ship inside the pip
+package so it stays offline) and `energy` (`split_nonsilent`'s frame RMS — no extra dependency,
+the automatic fallback, but it smears speech ~one 128ms analysis frame into adjacent silence
+and so under-measures pause width by about that much).
+
+Outcomes recorded per row in `stages/align.jsonl` as `vad_status`, alongside the pre-snap
+`insert_at_aligned_s`, so a moved or dropped row is explainable without re-running the aligner:
+`in_pause` (already inside a pause; moved to its midpoint, the furthest point from either
+speech edge), `snapped`, `no_pause`, `disabled`.
+
+### Why the shift budget is small, and why `on_no_pause` defaults to `keep`
+
+`vad.max_shift_s` is a **semantic** bound, not an acoustic one: the aligner placed the tag
+between two specific words, and moving the event far from there inserts it between *different*
+words than the transcript claims.
+
+That bound collides with what the corpus actually looks like. Measured on the same 20-row
+batch: distance from the aligned position to the nearest qualifying pause was **median 2.02s**
+(min 0.28, max 13.65), and **3 of 20 recordings had no qualifying pause at all** — these are
+15–20s of near-continuous Vietnamese speech with only 0–7 pauses each. Yield by budget:
+
+| `max_shift_s` | rows that snap |
+|---|---|
+| 0.3 | 1/17 |
+| 0.5 (default) | 1/17 |
+| 1.0 | 4/17 |
+| 2.0 | 7/17 |
+
+So a budget big enough to reach a pause on most rows is well past the point where placement
+stops matching the transcript. With `on_no_pause: skip`, the defaults would have dropped
+**19 of 20 rows** on that batch — which is why the default is `keep`: snapping is a strict
+improvement where a pause exists nearby (the one row that snapped went from 0.16 boundary
+activity to 0.01) and a no-op where one doesn't, with `quality.max_boundary_activity` still
+judging the rows that stayed put. Set `skip` only when a mid-utterance splice is unacceptable
+and yield doesn't matter — check the `no_pause` count in the align summary first.
+
+The deeper fix isn't a bigger shift budget: it's choosing the tag's *position in the
+transcript* to coincide with a pause in the first place, rather than placing it from text and
+then dragging the audio edit toward silence. See "Deliberately not implemented".
 
 ### Why Montreal Forced Aligner was removed
 
@@ -406,6 +460,18 @@ than a core dependency for exactly that reason.
 
 A few DSP/selection ideas were considered and rejected — noted here so they don't get
 re-proposed or "fixed in" without re-litigating the reasoning:
+
+- **Pause-aware tag placement** (not rejected — *not built yet*, and the natural successor to
+  VAD pause snapping). Today the order is: LLM picks a tag position from the transcript →
+  forced alignment turns that into a time → VAD tries to drag that time onto a pause. The
+  measurement in "VAD pause snapping" shows why that last step mostly can't fire: in
+  near-continuous speech the chosen position simply isn't near a pause (median 2.02s away).
+  Inverting it would fix the cause rather than the symptom — detect pauses first, then have
+  the tagger place the tag at the word boundary that *already* coincides with one, so
+  position and pause agree by construction and no shift is needed. `qwen_omni_audio` is
+  partway there (it hears the recording, and its prompt asks for a position where the speaker
+  pauses), but nothing constrains its answer to a detected pause. Touches `tagging.py` and the
+  align stage together, so it was left as a deliberate next step rather than bolted on.
 
 - **Mel-spectrogram + neural-vocoder (HiFi-GAN) resynthesis of the stitched waveform** at
   the splice step — see "Splicing: fixed vs. adaptive vs. tempo" above. Regenerates the entire

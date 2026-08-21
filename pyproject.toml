@@ -26,6 +26,10 @@ tagging-gemini = ["google-generativeai"]
 audio-extra = ["soxr"]
 # Vietnamese romanization for the MMS_FA fallback aligner (para_synth/align/mms.py)
 mms = ["uroman"]
+# Silero VAD, used to keep the splice out of mid-utterance (para_synth/vad.py). Optional:
+# without it vad.backend falls back to the energy detector, which is weaker at telling a
+# breath from speech. The package bundles its own weights, so it needs no download.
+vad = ["silero-vad>=5"]
 # NISQA quality filter, the `filter` stage (para_synth/nisqa.py). Optional because nothing
 # else needs it, and because the model weights torchmetrics fetches are CC BY-NC-SA 4.0
 # (non-commercial) — see the licence note in configs/default.yaml.

@@ -33,6 +33,7 @@ from para_synth.dataset import ManifestRow, extract_tag, merge_by_id, read_jsonl
 from para_synth.quality import SpeakerSimilarity, build_speaker_similarity
 from para_synth.seedvc import run_seedvc
 from para_synth.selection import pick_vocalsound_clip, profile_speaker
+from para_synth.vad import snap_insert_time
 from para_synth.vocalsound import match_vs_class
 
 
@@ -228,19 +229,55 @@ def align_batch(
 
     align_pipeline = AlignmentPipeline(cfg.alignment, cfg.models)
     fresh: list[dict] = []
+    vad_counts: dict[str, int] = {}
+    dropped_no_pause = 0
     for i, row in enumerate(todo, 1):
         print(f"\n[{i}/{len(todo)}] {row.id}")
         try:
             wav, sr = load_mono(row.audio_filepath)
             insert_at_s, insert_stage = align_pipeline.find_insert_time(row, wav, sr, language=language)
             print(f"   🧭 insertion time estimate: {insert_at_s:.2f}s (stage={insert_stage})")
-            fresh.append({"id": row.id, "insert_at_s": insert_at_s, "insert_stage": insert_stage})
+
+            # A word boundary is not a pause — move the cut onto one, so the event lands in
+            # silence between utterances instead of slicing a vowel. See para_synth/vad.py.
+            snap = snap_insert_time(wav, sr, insert_at_s, cfg.vad)
+            vad_counts[snap.status] = vad_counts.get(snap.status, 0) + 1
+            if snap.status == "no_pause" and cfg.vad.enabled:
+                if cfg.vad.on_no_pause == "skip":
+                    print(f"   ⏭️  skipped: no VAD pause within {cfg.vad.max_shift_s:.2f}s of "
+                          f"{insert_at_s:.2f}s (vad.on_no_pause: skip)")
+                    dropped_no_pause += 1
+                    continue
+                print(f"   ⚠️  no VAD pause within {cfg.vad.max_shift_s:.2f}s — splicing at the "
+                      f"unsnapped time (vad.on_no_pause: keep)")
+            elif snap.status in ("in_pause", "snapped"):
+                print(f"   🔇 {snap.status}: {insert_at_s:.2f}s -> {snap.time_s:.2f}s "
+                      f"({snap.shift_s:+.2f}s, pause {snap.pause_s:.2f}s)")
+
+            fresh.append({
+                "id": row.id,
+                "insert_at_s": snap.time_s,
+                "insert_stage": insert_stage,
+                # Keep the pre-snap time and the VAD verdict: they explain why a row moved
+                # (or was dropped) without re-running the aligner to find out.
+                "insert_at_aligned_s": insert_at_s,
+                "vad_status": snap.status,
+                "vad_shift_s": snap.shift_s,
+                "vad_pause_s": snap.pause_s,
+            })
         except Exception as e:
             print(f"   ⚠️  skipped {row.id}: {type(e).__name__}: {e}")
 
     merged = merge_by_id(cached, fresh)
     write_jsonl(out_path, merged)
     print(f"\n🧭 {len(fresh)}/{len(todo)} rows aligned ({len(merged)} total) -> {out_path}")
+    if cfg.vad.enabled and vad_counts:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(vad_counts.items()))
+        print(f"   VAD pause snapping ({cfg.vad.backend}): {summary}")
+        if dropped_no_pause:
+            print(f"   {dropped_no_pause} row(s) dropped for having no pause within "
+                  f"{cfg.vad.max_shift_s:.2f}s — raise vad.max_shift_s, lower vad.min_pause_s, "
+                  f"or set vad.on_no_pause: keep to include them")
     return merged
 
 

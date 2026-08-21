@@ -68,6 +68,53 @@ alignment:
   # OOV. See "Alignment stage order" in docs/PIPELINE.md.
   use_qwen3: true
 
+vad:
+  # Keeps the splice out of the middle of an utterance (para_synth/vad.py).
+  #
+  # Forced alignment answers "between which two words does the [tag] go" — but a word
+  # boundary in connected speech is usually continuous phonation, not a pause, so the
+  # aligned time lands mid-voice routinely: worst-junction activity on the first real
+  # 20-row batch spanned 0.04-1.76, MEDIAN 0.85 (see quality.max_boundary_activity, which
+  # rejects such rows after the fact). This moves the cut onto a real pause instead, so
+  # those rows become usable rather than filtered out.
+  enabled: true
+  # silero — a trained speech/non-speech classifier; robust where an energy threshold
+  #          misfires, which is exactly the between-utterance gap where breaths live (a
+  #          breath is "not silent" to RMS but "not speech" to a VAD). Weights ship inside
+  #          the pip package, so it stays offline. Install: pip install -e '.[vad]'
+  # energy  — split_nonsilent()'s frame-RMS threshold, already used elsewhere here. No
+  #          extra dependency, and the automatic fallback if silero-vad isn't installed.
+  backend: silero
+  min_pause_s: 0.12 # ignore gaps shorter than this — a stop closure is not a pause
+  # How far the cut may move to reach a pause. This is a SEMANTIC bound, not an acoustic
+  # one: the aligner put the tag between two specific words, and moving the event far from
+  # there inserts it between *different* words than the transcript claims. That is why the
+  # answer to "no pause nearby" is to reject the row rather than search further out.
+  # MEASURED on the first real 20-row batch: distance from the aligned tag position to the
+  # nearest pause was median 2.02s (min 0.28, max 13.65), and 3 of 20 recordings had no
+  # qualifying pause at all — these are ~15-20s of near-continuous Vietnamese speech with
+  # only 0-7 pauses each. So a shift budget big enough to reach a pause on most rows
+  # (~2-3s) is far past the point where the event lands between the words the transcript
+  # says it does. 0.5s keeps the move to roughly one word's width.
+  #   max_shift_s: 0.3 -> 1/17 rows snap | 0.5 -> 1/17 | 1.0 -> 4/17 | 2.0 -> 7/17
+  max_shift_s: 0.5
+  merge_gap_s: 0.10 # join speech regions closer than this before looking for pauses;
+  # without it, every glottal break and stop closure reads as its own "pause"
+  edge_margin_s: 0.05 # trim each pause's edges, where the neighbouring words' energy is
+  # already rising. NOTE the `energy` backend already smears speech ~one analysis frame
+  # (128ms) into adjacent silence, so it under-measures pause width by about that much on
+  # top of this margin — expect it to find far fewer pauses than `silero` on the same audio.
+  # What to do when no qualifying pause is within max_shift_s:
+  #   keep — splice at the unsnapped aligned time (default). Given the measurement above,
+  #          `skip` would have dropped 19 of 20 rows on the reference batch, so keeping is
+  #          the only setting with usable yield on a corpus like this. Rows that stay
+  #          mid-utterance are still judged by quality.max_boundary_activity in `filter`,
+  #          so this loses nothing that was previously caught — VAD snapping is a strict
+  #          improvement where a pause exists and a no-op where one doesn't.
+  #   skip — drop the row instead. Use when a mid-utterance splice is unacceptable and
+  #          yield doesn't matter; check the `no_pause` count in the align summary first.
+  on_no_pause: keep
+
 models:
   # third_party/models/ is laid out by pipeline purpose, not by vendor — see
   # third_party/models/README.md. Local snapshot dirs fall back to downloading from the
