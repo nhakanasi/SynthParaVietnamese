@@ -23,6 +23,61 @@ import requests
 
 VS_CLASSES = ["laughter", "sigh", "cough", "throatclearing", "sneeze", "sniff"]
 
+# ── Per-class respiratory profile ────────────────────────────────────────────────────
+# Two tables describing how each class differs from "a generic sound inserted into speech".
+# Both are applied by `tempo_splice` as *relative* terms on top of a per-speaker measurement,
+# never as absolute milliseconds or dB — the speaker's own pause tempo and own local speech
+# level stay the base, so these carry only what is specific to the event class.
+#
+# HONEST PROVENANCE: unlike selection.py's tolerances, these are priors, not measurements
+# from this corpus. They encode one physical claim — the respiratory state an event *ends*
+# in differs from the one it starts in, so the silence before and after it is not the same
+# length — and the direction of each entry follows from that claim. The magnitudes are a
+# starting point to be tuned by ear against a real batch; `splice.gap_shape` and
+# `splice.level_offsets_db` in the config override any of them without a code change.
+
+# (pre_scale, post_scale) multiplying the speaker's median pause. Events that end on
+# depleted lungs (laughter, sigh) need a long trailing beat plus room for an intake before
+# speech resumes, so post > pre. Events that end ready to phonate (sniff, throat-clearing)
+# need very little after.
+GAP_SHAPE = {
+    "laughter": (0.6, 1.4),        # deep exhalation; audible intake before resuming
+    "sigh": (0.5, 1.2),            # empty lungs, tapering tail
+    "cough": (0.7, 1.0),           # closed glottis, resumes on a clean onset
+    "throatclearing": (0.7, 1.0),  # same, and usually deliberate — short either side
+    "sneeze": (0.8, 1.3),          # sharp, involuntary; a real beat afterwards
+    "sniff": (0.5, 0.7),           # brief intake, speech resumes almost immediately
+}
+
+# dB applied to the event's RMS relative to the speaker's local speech RMS, when
+# `splice.level_ref` is "context_rms". A laugh really is louder than conversational speech
+# and a sniff really is quieter; levelling every class to the same target is wrong for both
+# in opposite directions.
+LEVEL_OFFSET_DB = {
+    "laughter": 3.0,
+    "sigh": -4.0,
+    "cough": 2.0,
+    "throatclearing": -2.0,
+    "sneeze": 4.0,
+    "sniff": -5.0,
+}
+
+
+def gap_shape(vs_class: str, overrides: dict | None = None) -> tuple[float, float]:
+    """(pre_scale, post_scale) for a class, with a config override taking precedence."""
+    if overrides and vs_class in overrides:
+        pre, post = overrides[vs_class]
+        return float(pre), float(post)
+    return GAP_SHAPE.get(vs_class, (1.0, 1.0))
+
+
+def level_offset_db(vs_class: str, overrides: dict | None = None) -> float:
+    """Per-class dB offset, with a config override taking precedence."""
+    if overrides and vs_class in overrides:
+        return float(overrides[vs_class])
+    return float(LEVEL_OFFSET_DB.get(vs_class, 0.0))
+
+
 # VocalSound filenames look like: f0003_0_laughter.wav  (gender, speaker id, take, class)
 VS_PAT = re.compile(r"^([fm])(\d+)_(\d+)_(" + "|".join(VS_CLASSES) + r")\.wav$")
 

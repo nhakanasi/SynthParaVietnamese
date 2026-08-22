@@ -34,7 +34,7 @@ from para_synth.quality import SpeakerSimilarity, build_speaker_similarity
 from para_synth.seedvc import run_seedvc
 from para_synth.selection import pick_vocalsound_clip, profile_speaker
 from para_synth.vad import snap_insert_time
-from para_synth.vocalsound import match_vs_class
+from para_synth.vocalsound import gap_shape, level_offset_db, match_vs_class
 
 
 @dataclass
@@ -105,16 +105,24 @@ def synthesize_row(
               f"({sim_converted:.3f} <= {sim_raw_baseline:.3f})")
 
     if cfg.splice.mode == "tempo":
+        # The event class sets how the silence is shaped and how loud the event sits, both
+        # as relative terms on top of per-speaker measurements — see vocalsound.GAP_SHAPE
+        # and LEVEL_OFFSET_DB. `rng` seeds the room-tone bridges so a run reproduces.
+        pre_scale, post_scale = gap_shape(vs_class, cfg.splice.gap_shape)
         final, at = tempo_splice(
-            speech_arr, conv_arr, cfg.sample_rate, cfg.splice.para_gain_db,
+            speech_arr, conv_arr, cfg.sample_rate, cfg.splice.gain_db(),
             cfg.splice.fade_ms, at_s=insert_at_s,
             gap_scale=cfg.splice.gap_scale, fade_k=cfg.splice.fade_k,
+            pre_scale=pre_scale, post_scale=post_scale,
+            level_ref=cfg.splice.level_ref, context_s=cfg.selection.context_s,
+            level_offset_db=level_offset_db(vs_class, cfg.splice.level_offsets_db),
+            rng=rng,
         )
     elif cfg.splice.mode == "adaptive":
         final, at = adaptive_splice(
             speech_arr, conv_arr, cfg.sample_rate, cfg.splice.para_gain_db,
             cfg.splice.min_pad_ms, cfg.splice.max_gap_ms, cfg.splice.fade_ms,
-            at_s=insert_at_s,
+            at_s=insert_at_s, rng=rng,
         )
     else:
         final, at = splice(

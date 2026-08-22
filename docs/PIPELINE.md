@@ -142,9 +142,60 @@ length, which neither other mode addresses:
 Measured A/B over all 20 rows (max sample-to-sample step at the junction, lower = less
 audible as a cut): mean **0.04065 → 0.00067, a 61x reduction**, improving on every row.
 
-Both bridges are `matched_room_tone()` — low-level noise at the recording's own floor
-(`quietest_window()`), not true digital silence, since a hard zero between two segments that
-both have real background noise reads as an artificial mute.
+Both bridges are `matched_room_tone()` — the recording's own floor (`quietest_window()`), not
+true digital silence, since a hard zero between two segments that both have real background
+noise reads as an artificial mute.
+
+### Three later corrections to `tempo_splice`
+
+The three above were measured against the *pre-slots* pipeline, where the cut landed
+mid-phonation on 20/20 rows. Slot-constrained placement changed the premise — the cut is now
+in real silence by construction — and that exposed three things the original got wrong:
+
+- **The gap was additive, not a budget.** `slots.Slot.time_s` is the midpoint of a VAD pause,
+  so each side of the cut already carries `pause_s/2 + vad.edge_margin_s` of silence, and a
+  full tempo gap was then added on top of it. `existing_silence_s()` measures what each side
+  already has and only the shortfall is inserted, clamped at zero (silence already in the
+  recording is the speaker's own audio and is never shortened). Measured on a synthetic take
+  with a 600ms pause: total silence around the event **1389ms → 857ms**; with a 150ms pause,
+  **233ms → 140ms**. It is measured rather than read off `Slot.pause_s` so it also covers the
+  paths with no slot (a pre-tagged manifest, `vad.on_no_pause: keep`) and doesn't assume the
+  VAD midpoint is the *acoustic* midpoint. Its first implementation used
+  `split_nonsilent()`'s interval edges and was replaced: that detector frames at 2048 samples
+  and pads run edges by `frame_length // 2` (~46ms), so a cut 50ms inside a genuine 600ms
+  pause came back as 0ms of silence on both sides. A 10ms analysis window resolves it to
+  within one frame.
+- **One symmetric gap can be right on at most one side.** The respiratory state an event
+  *ends* in is not the one it starts in: a laugh ends on depleted lungs and needs a trailing
+  beat plus an intake before speech resumes, a sniff ends ready to phonate.
+  `vocalsound.GAP_SHAPE` supplies `(pre_scale, post_scale)` per class, multiplying the
+  speaker's own measured pause — relative terms on a per-speaker base, never absolute
+  milliseconds. **These are priors, not measurements from this corpus**, unlike everything
+  else on this page; the physical claim behind their direction is sound, the magnitudes want
+  tuning by ear. `splice.gap_shape` overrides them without a code change.
+- **The bridge was white noise.** `matched_room_tone()` synthesized Gaussian noise matched to
+  the floor's RMS but not to its *spectrum*, and real noise floors are strongly
+  low-frequency-tilted — a denoised or band-limited corpus has almost no HF floor at all.
+  Measured on a synthetic take whose floor carries 1.5% of its energy above 2kHz, the
+  synthesized bridge carried **82%**: a short puff of hiss appearing exactly where the edit
+  is, i.e. *more* audible than the silence it replaced. It now tiles `quietest_window()`'s
+  real samples (seam-crossfaded by `_loopable`, start phase from the run's RNG), which
+  carries the true spectrum by construction — measured 1.3% against the floor's 1.5%. The
+  synthesized path survives only as a fallback for a reference too short to tile.
+
+Two smaller fixes alongside them. `matched_room_tone()` drew from numpy's **global** RNG, so
+`seed:` never actually reproduced the bridge; it now takes the run's `Config.rng(row.id)`.
+And the event's level was set from `max(|speech|)` over the whole utterance, so one plosive
+or stray click anywhere in a 20-second take set it — measured, a single 0.99 sample moved the
+event **+10.4 dB**. `level_insert()` with `splice.level_ref: context_rms` references the RMS
+of the `selection.context_s` seconds before the cut instead (**+0.00 dB** under the same
+click), which also removes a real inconsistency: `selection.speaker_energy_score` already
+matches clip intensity against that same local window, so the two stages had been referenced
+to different things. Per-class `vocalsound.LEVEL_OFFSET_DB` then moves each class off that
+baseline — a laugh sits above conversational RMS and a sniff below, so one target is wrong
+for both in opposite directions. `context_gain_db` is a separate config field from
+`para_gain_db` on purpose: they are different quantities (dB vs. local RMS, versus dB under
+the global peak) and one field meaning either depending on a neighbouring field is a trap.
 
 Deliberately *not* implemented: full mel-spectrogram + neural-vocoder (e.g. HiFi-GAN)
 resynthesis of the stitched waveform. That approach regenerates the *entire* recording's
@@ -520,6 +571,15 @@ re-proposed or "fixed in" without re-litigating the reasoning:
   Note this rejects *stretching* a clip, not `selection.tempo_weight`, which picks a clip
   whose native rate already fits and never touches a waveform — and which is restricted to
   laughter for exactly the reflex argument above (`selection.TEMPO_MATCHED_CLASSES`).
+- **Pitch-shifting, formant-warping (VTLN) or spectral-tilt-shaping the donor clip to fit
+  the host speaker's anatomy** — the standard advice for splicing a "big" laugh into a
+  "small" voice, and wrong for *this* pipeline specifically, because it assumes the donor's
+  own acoustics reach the output. They don't: Seed-VC re-renders the event from the target
+  speaker's CAM++ style vector, so timbre, formant structure and pitch register are already
+  the host's. Pre-shifting would spend DSP artifacts on properties the conversion is about to
+  discard, and `librosa.effects.pitch_shift`-class processing on breathy/transient
+  vocalisations smears them (the same argument that rejects time-stretching above). The one
+  reading of that advice that survives is the *selection* one, and it is measured below.
 - **Selecting clips by pitch (F0), or by F0 contour shape** — measured and rejected: with
   `seedvc.f0_condition: false` Seed-VC v1 regenerates the event's pitch from the target
   speaker, so the source clip's F0 contributes essentially nothing (regression coefficient
@@ -532,6 +592,15 @@ re-proposed or "fixed in" without re-litigating the reasoning:
   difference), while a noise-floor-referenced "highest band above the floor" measure
   saturates (clips p10..p90 = 7656..8000 Hz, speech 7127..7989 Hz — both corpora are simply
   full-band). Clarity is dB SNR alone.
+- **Deriving the intensity target only from the speech** — kept, but no longer as a *point*
+  estimate. `speaker_energy_score` reads the speaker's loudness rank at the splice point, and
+  aiming every row at it assumes a person's laugh scales with how loudly they were speaking.
+  A quiet, slow speaker with a loud laugh is a real and common person that a point target can
+  only reach through the sampling weight's tail. `selection.intensity_spread` draws the
+  target per row around the speaker's rank instead, so the correlation survives on average
+  while genuine mismatches occur at a rate that was chosen. Lowering `energy_weight` is not
+  the same fix and is not a substitute: that makes the axis sloppy in both directions rather
+  than aiming it somewhere honest.
 - **Hard-filtering VocalSound clips by the speaker's vocal register** (e.g. a soft-spoken
   speaker may *only* receive soft laughs) — a real person's laugh/cough doesn't reliably
   scale with how loud or soft they speak, so a hard filter encodes a stereotype that's
@@ -652,3 +721,39 @@ tripped it — cheap insurance, not an active filter.)
 Note that `splice.para_gain_db` and `seedvc.length_adjust` are *not* substitutes here: gain
 only rescales the mix level and Seed-VC converts timbre, so neither turns an acoustically
 boisterous laugh into a gentle one. Selection is the layer where that distinction is made.
+
+### Precomputed clip features
+
+`scripts/build_clip_features.py` measures the whole corpus once into a JSON manifest that
+`selection.feature_manifest` points at. Without it the selector decodes `candidate_pool` (48)
+random clips per row, which caps the candidate set at ~1.4% of a ~3,500-clip class and does
+it across three or four axes *simultaneously* — best-of-48 on a joint match is a long way
+from best-available. With it the candidate set is the whole class, only the winning clip is
+ever decoded, and the intensity percentile ranks become corpus-wide rather than draw-wide
+(ranked inside 48 resampled clips, the same clip scores differently on different rows and the
+extremes saturate: in-pool rank 1.0 only means "loudest of those 48").
+
+It stores **raw physical measurements only** — never ranks, distances or scores. Ranks depend
+on the population and distances depend on the target recording and the axis weights, so
+storing either would make re-weighting an axis or re-scaling a tolerance require a full
+re-extraction. As stored, all of that is free; only changing an *extractor* costs a rebuild
+(~2 minutes for 21k clips), and `selection.FEATURE_VERSION` turns a stale manifest into a
+warning plus a fallback to per-row sampling, never a silently wrong run. Same
+cache-the-measurement / re-tune-the-threshold policy the NISQA stage uses.
+
+### Axis authority is not the same as axis weight
+
+The three tolerance constants exist so that a distance of ~1.0 means "clearly audible
+mismatch" on every axis and the weights are therefore comparable. Intensity was the exception:
+it had no tolerance at all, i.e. an implicit one of 1.0 — the entire range of a percentile
+difference. **Measured** at the shipped `energy_weight: 1.0`, the axis moved the realised
+intensity only ~7% of the way from uniform toward its target (aim 0.33 → realised 0.47), and
+its p10..p90 weighted span was 0.45 nats against clarity's 1.54 and tempo's 1.14 — about a
+third of the authority the same number bought elsewhere. `INTENSITY_TOLERANCE_RANK = 0.35`
+restores the intended calibration on the same "≈ a third of the usable spread" basis the
+other two use. `intensity_spread` was measurably inert before this fix and works after it
+(realised sd 0.179 → 0.221 as spread goes 0.0 → 0.4, against 0.222 → 0.222 before).
+
+The general lesson is worth keeping: a weight only means something relative to the range its
+axis's distance actually spans on real data. Check the `selection_axes` audit trail in
+`metadata_synth.jsonl` for the realised p10/p90 per axis before trusting a weight.

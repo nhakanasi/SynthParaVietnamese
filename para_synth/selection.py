@@ -44,8 +44,11 @@ Two different comparison scales are used, on purpose:
 
   * Intensity is compared as **percentile rank** — crest factor and duration have no
     meaningful absolute scale shared between a laugh and a speech recording, so each side
-    is ranked within its own reference population (clip: the candidate pool; speaker: all
-    same-length windows of their own utterance).
+    is ranked within its own reference population (clip: the whole class when a feature
+    manifest is built, else the sampled candidate pool; speaker: all same-length windows of
+    their own utterance). The rank difference is then divided by `INTENSITY_TOLERANCE_RANK`
+    so it lands on the same 0..2 scale the other two axes' tolerances produce — without that
+    the same weight bought about a third the authority here that it did elsewhere.
   * Clarity and tempo are compared as **absolute dimensionless quantities** — dB SNR and
     envelope rate in Hz. These are already ratios/rates on perceptually meaningful scales
     and are invariant to recording gain, so a clip and a speech recording can be compared
@@ -80,6 +83,12 @@ import numpy as np
 from para_synth.audio_utils import load_mono, trim_event
 from para_synth.vocalsound import list_clips
 
+# Bumped whenever any extractor below changes its output for the same input. The
+# precomputed manifest (scripts/build_clip_features.py) stores this, and a manifest whose
+# version doesn't match is ignored with a warning rather than silently trusted — the
+# manifest is a cache, never a commitment to a measurement.
+FEATURE_VERSION = 1
+
 # Laughter is the only class whose rate is under voluntary motor control the way speaking
 # rate is, so it's the only one where "match the speaker's tempo" means anything. A sigh is
 # a single breath (no rate to speak of); the rest are reflexes.
@@ -95,8 +104,24 @@ TEMPO_MATCHED_CLASSES = {"laughter"}
 # (laughter alone 1.5/3.8/4.8) against speech 2.8-6.0 Hz, so an octave is again about a
 # third of the spread. Both axes therefore produce distances that span ~0-2 across a
 # candidate pool, i.e. weights that actually discriminate at a config weight near 1.
+# Intensity had no tolerance constant at all, i.e. an implicit one of 1.0 — the full range
+# of a percentile difference. MEASURED consequence: at the shipped `energy_weight: 1.0` the
+# axis moved the realised intensity only ~7% of the way from uniform toward its target
+# (aim 0.33 -> realised 0.47), and its p10..p90 weighted span was 0.45 nats against clarity's
+# 1.54 and tempo's 1.14. So the module docstring's claim that the three weights are
+# "comparable to each other" was true of the intended design and false of the code: intensity
+# had roughly a third of the authority the same number bought on either other axis.
+# 0.35 restores the intended calibration on the same "≈ a third of the usable spread" basis
+# the other two use — realised intensity distances run p10..p90 ≈ 0.08..0.53, so dividing by
+# 0.35 puts the axis on the same 0..2 scale. Re-derive with scripts/measure_selection_axes.py.
+INTENSITY_TOLERANCE_RANK = 0.35
 SNR_TOLERANCE_DB = 12.0
 TEMPO_TOLERANCE_OCT = 1.0  # a 2x rate difference, e.g. a 3Hz chuckle vs a 6Hz giggle
+# NOT yet measured against this corpus, unlike the two above — 12 dB of swing across a
+# sound's span is a strong trend by inspection, but the honest calibration is a spread pass
+# over both corpora. `scripts/measure_selection_axes.py` now reports `tilt_db`; re-set this
+# from its p10/p90 before leaning on the axis, and keep `tilt_weight` modest until then.
+TILT_TOLERANCE_DB = 12.0
 
 
 def _rms(x) -> float:
@@ -212,6 +237,38 @@ def envelope_rate_hz(x, sr, min_separation_s: float = 0.06) -> float:
     return peaks / duration
 
 
+def envelope_tilt_db(x, sr) -> float:
+    """Loudness *trend* across the sound: dB from its start to its end (negative = decaying).
+
+    `envelope_rate_hz` above counts how often the envelope peaks; this says which way the
+    envelope is going. They are independent — a laugh that trails off and one that builds
+    can have identical burst rates — and this is the axis that carries "let the event decay
+    into the trailing pause", which is otherwise only reachable by DSP-shaping the waveform
+    after the fact. Selecting a clip that already decays does the same job and touches
+    nothing.
+
+    Residual for the same reason tempo is: at `seedvc.length_adjust: 1.0` the conversion
+    preserves the source's amplitude trajectory, so the trend is the original contributor's,
+    not the target speaker's.
+
+    Matched against the speaker's *own* trend over the pre-splice context window rather than
+    against a fixed preference for decay: a speaker trailing off into a pause is continued by
+    a decaying laugh, and one still building is continued by a rising one. Both estimators
+    have to be the same function for that comparison to mean anything, so this stays generic.
+
+    The dB floor at (max - 40) keeps `trim_event`'s residual head/tail padding, and any
+    silence inside the clip, from dominating a fit run on log values.
+    """
+    env = _frame_rms(x, sr, win_s=0.030, hop_s=0.010)
+    if len(env) < 4:
+        return 0.0
+    db = 20.0 * np.log10(np.maximum(env, 1e-9))
+    db = np.maximum(db, db.max() - 40.0)
+    t = np.linspace(0.0, 1.0, len(db))
+    slope = float(np.polyfit(t, db, 1)[0])
+    return float(np.clip(slope, -60.0, 60.0))
+
+
 def speaker_energy_score(speech, sr, at_s: float, context_s: float) -> float:
     """How loud is this speaker, in the moments before the splice point, *relative to
     their own range across this recording*? 0..1, where ~0.9 means "one of the louder
@@ -261,6 +318,7 @@ class SpeakerProfile:
     energy_rank: float
     snr: float
     rate: float
+    tilt: float = 0.0
 
 
 def profile_speaker(speech, sr, at_s: float, context_s: float) -> SpeakerProfile:
@@ -280,6 +338,7 @@ def profile_speaker(speech, sr, at_s: float, context_s: float) -> SpeakerProfile
         energy_rank=speaker_energy_score(speech, sr, at_s, context_s),
         snr=snr_db(speech, sr),
         rate=envelope_rate_hz(context, sr),
+        tilt=envelope_tilt_db(context, sr),
     )
 
 
@@ -289,12 +348,15 @@ def profile_speaker(speech, sr, at_s: float, context_s: float) -> SpeakerProfile
 @dataclass
 class _Candidate:
     name: str
-    trimmed: np.ndarray
+    # None on the manifest path — measurements came from the cache and only the chosen
+    # clip is ever decoded. `sr` is 0 in that case for the same reason.
+    trimmed: np.ndarray | None
     sr: int
     crest: float
     duration: float
     snr: float
     rate: float
+    tilt: float = 0.0
 
 
 @dataclass
@@ -320,19 +382,29 @@ def _octave_distance(a: float, b: float, tolerance_oct: float) -> float:
     return abs(np.log2(a / b)) / tolerance_oct
 
 
-def _axis_distances(cand: _Candidate, profile: SpeakerProfile, intensity: float, vs_class: str):
+def _axis_distances(cand: _Candidate, profile: SpeakerProfile, intensity: float,
+                    vs_class: str, intensity_target: float | None = None):
     """Per-axis distances in comparable units. Intensity is a percentile difference (0..1);
-    the others are physical differences scaled by their tolerance constant."""
+    the others are physical differences scaled by their tolerance constant.
+
+    `intensity_target` is the rank this row is actually aiming at, which is *not* necessarily
+    the speaker's own energy rank — see `pick_vocalsound_clip` and `SelectionConfig
+    .intensity_spread`. Both are recorded in the audit trail so a finished run can be checked
+    for whether the realised spread matches the configured one.
+    """
     # Symmetric: a clip noticeably cleaner than the recording is a mismatch too — the
     # background drops out for the duration of the event, which reads as a punched-in edit
     # the same way excess hiss does (less badly, but the splice's matched_room_tone only
     # fills the *gap*, not the event itself).
     clarity = abs(cand.snr - profile.snr) / SNR_TOLERANCE_DB
+    aim = profile.energy_rank if intensity_target is None else intensity_target
     axes = {
-        "intensity": {"target": profile.energy_rank, "clip": intensity,
-                      "distance": abs(intensity - profile.energy_rank)},
+        "intensity": {"target": aim, "speaker_rank": profile.energy_rank, "clip": intensity,
+                      "distance": abs(intensity - aim) / INTENSITY_TOLERANCE_RANK},
         "clarity": {"target_snr_db": profile.snr, "clip_snr_db": cand.snr,
                     "distance": clarity},
+        "tilt": {"target_db": profile.tilt, "clip_db": cand.tilt,
+                 "distance": abs(cand.tilt - profile.tilt) / TILT_TOLERANCE_DB},
     }
     if vs_class in TEMPO_MATCHED_CLASSES:
         axes["tempo"] = {
@@ -355,6 +427,125 @@ def _finalize_clip(trimmed, sr):
     return out
 
 
+# ── Precomputed clip features ────────────────────────────────────────────────────────
+
+
+def measure_clip(raw, sr) -> dict | None:
+    """Every per-clip measurement the selector needs, from one decode. Returns None for a
+    clip `_usable_clip` would reject, so rejects never occupy a slot in a candidate pool.
+
+    Deliberately returns **raw physical values**, never ranks, distances or scores. Ranks
+    depend on the population and distances depend on the target recording and on the axis
+    weights, so baking either into the manifest would make a re-weighting or a re-scaling
+    require a re-extraction. As stored, changing `SNR_TOLERANCE_DB`, adding an axis weight,
+    or rewriting `_axis_distances` costs nothing; only changing an extractor here does, and
+    that is what `FEATURE_VERSION` exists to catch.
+    """
+    trimmed = trim_event(raw, sr)
+    if not _usable_clip(trimmed, sr):
+        return None
+    crest, duration = clip_features(trimmed, sr)
+    return {
+        "crest": crest,
+        "duration": duration,
+        # Channel measures come from the untrimmed clip — trim_event removes the
+        # leading/trailing silence the noise floor is estimated from.
+        "snr_db": snr_db(raw, sr),
+        "rate_hz": envelope_rate_hz(trimmed, sr),
+        "tilt_db": envelope_tilt_db(trimmed, sr),
+        "clipping": clipping_fraction(raw),
+    }
+
+
+def load_feature_manifest(path) -> dict | None:
+    """`{clip_name: measurements}` from a manifest built by scripts/build_clip_features.py,
+    or None if there isn't a usable one.
+
+    A version mismatch is a warning and a None, not an error: the pipeline falls back to
+    measuring a sampled pool per row, which is exactly what it did before manifests existed.
+    A stale cache should cost accuracy that the operator is told about, never a failed run.
+    """
+    import json
+
+    if not path:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        print(f"⚠️  no clip-feature manifest at {path} — falling back to per-row sampling "
+              f"(build one with scripts/build_clip_features.py)")
+        return None
+    data = json.loads(path.read_text())
+    version = data.get("feature_version")
+    if version != FEATURE_VERSION:
+        print(f"⚠️  clip-feature manifest at {path} is version {version}, code expects "
+              f"{FEATURE_VERSION} — ignoring it. Rebuild with scripts/build_clip_features.py")
+        return None
+    return data.get("clips", {})
+
+
+_MANIFEST_CACHE: dict = {}
+
+
+def _manifest_for(cfg) -> dict | None:
+    """`load_feature_manifest` memoised on the path — a run touches it once per row."""
+    key = str(getattr(cfg, "feature_manifest", "") or "")
+    if key not in _MANIFEST_CACHE:
+        _MANIFEST_CACHE[key] = load_feature_manifest(key)
+    return _MANIFEST_CACHE[key]
+
+
+# ── Candidate assembly ───────────────────────────────────────────────────────────────
+
+
+def _candidates_from_manifest(manifest: dict, pool: list[str], cfg) -> list[_Candidate]:
+    """Every clip of the class that the manifest already has measurements for.
+
+    This is the point of precomputing. Measuring in-process costs a decode per candidate, so
+    `candidate_pool` has to stay small (48) and the selector picks the best of 48 out of a
+    class of ~3,500 — across three or four axes *simultaneously*, which is where best-of-48
+    falls a long way short of best-available. Reading measurements costs nothing, so the pool
+    becomes the whole class and only the winning clip is ever decoded.
+
+    It also makes the intensity ranks corpus-wide instead of draw-wide. Ranked within 48
+    resampled clips, the same clip scores differently on different rows (the empirical CDF of
+    a 48-sample draw has ~0.07 sd at the median) and the extremes saturate — in-pool rank 1.0
+    is whatever happened to be loudest among 48, not a genuinely extreme clip.
+    """
+    out = []
+    for name in pool:
+        m = manifest.get(name)
+        if m is None or m.get("clipping", 0.0) > cfg.max_clipping:
+            continue
+        out.append(_Candidate(
+            name=name, trimmed=None, sr=0,
+            crest=m["crest"], duration=m["duration"],
+            snr=m["snr_db"], rate=m["rate_hz"], tilt=m.get("tilt_db", 0.0),
+        ))
+    return out
+
+
+def _candidates_from_audio(vs_dir: Path, pool: list[str], rng, cfg) -> list[_Candidate]:
+    """The no-manifest path: decode and measure `cfg.candidate_pool` random clips of the
+    class. Clipped candidates are held back and only used if nothing else survives — a
+    clipped source is distortion Seed-VC reconstructs faithfully, but failing the row over it
+    would be worse."""
+    names = rng.sample(pool, min(cfg.candidate_pool, len(pool)))
+    candidates: list[_Candidate] = []
+    clipped: list[_Candidate] = []
+    for name in names:
+        raw, raw_sr = load_mono(vs_dir / name)
+        m = measure_clip(raw, raw_sr)
+        if m is None:
+            continue
+        cand = _Candidate(
+            name=name, trimmed=trim_event(raw, raw_sr), sr=raw_sr,
+            crest=m["crest"], duration=m["duration"],
+            snr=m["snr_db"], rate=m["rate_hz"], tilt=m["tilt_db"],
+        )
+        (clipped if m["clipping"] > cfg.max_clipping else candidates).append(cand)
+    return candidates or clipped
+
+
 def pick_vocalsound_clip(
     vs_dir: Path,
     vs_class: str,
@@ -368,13 +559,26 @@ def pick_vocalsound_clip(
     With every axis weight at 0 (or no `profile`), this is uniform random over the class —
     every clip equally likely, which is what the pipeline did before any matching existed.
 
-    Otherwise it loads `cfg.candidate_pool` random clips of the class, measures each on the
-    axes Seed-VC won't fix (see the module docstring), and samples with weight
+    Otherwise it assembles a candidate set (the whole class when `cfg.feature_manifest`
+    points at a built manifest, else `cfg.candidate_pool` decoded at random), measures each
+    on the axes Seed-VC won't fix (see the module docstring), and samples with weight
     `exp(-Σ weight_axis · distance_axis)`. Closer matches are *more likely* but never
     exclusive: every usable candidate keeps nonzero probability, so a big laugh from a
     soft-spoken speaker or a slightly noisier clip than the recording still happens — real
     recordings are not internally consistent either, and hard filtering would delete
     exactly the acoustic variance a downstream Para-TTS model benefits from.
+
+    **`cfg.intensity_spread` is the second, stronger half of that argument.** Soft weights
+    stop the selector from *forbidding* a mismatch, but the intensity target was still a
+    point estimate read off the speech (`speaker_energy_score`), which structurally assumes
+    a person's laugh scales with how loudly they were speaking. It often does not — a quiet,
+    slow speaker with a loud laugh is a real and common person, and under a point target the
+    only way to generate one is the exponential tail. Spread makes the *target* a
+    distribution, drawn per row around the speaker's rank: the correlation survives on
+    average while genuinely mismatched intensities occur at a rate that is set deliberately
+    instead of falling out of the weight. `intensity_spread: 0.0` reproduces the point-target
+    behaviour exactly, and lowering `energy_weight` is not a substitute — that just makes the
+    axis sloppy in both directions rather than aiming it somewhere honest.
 
     The one hard gate is `cfg.max_clipping`: a clipped source is distortion, not a
     mismatch, and Seed-VC reconstructs it faithfully. The gate is dropped rather than
@@ -385,7 +589,7 @@ def pick_vocalsound_clip(
         raise RuntimeError(f"No '{vs_class}' clips found in {vs_dir}")
 
     weights_off = profile is None or max(
-        cfg.energy_weight, cfg.clarity_weight, cfg.tempo_weight
+        cfg.energy_weight, cfg.clarity_weight, cfg.tempo_weight, cfg.tilt_weight
     ) <= 0
     if weights_off:
         for _ in range(max_tries):
@@ -397,45 +601,31 @@ def pick_vocalsound_clip(
                 return ClipPick(pick, _finalize_clip(cand, raw_sr), raw_sr, 0.5)
         raise RuntimeError(f"{max_tries} picks of '{vs_class}' were all too quiet/short")
 
-    names = rng.sample(pool, min(cfg.candidate_pool, len(pool)))
-    candidates: list[_Candidate] = []
-    clipped: list[_Candidate] = []
-    for name in names:
-        raw, raw_sr = load_mono(vs_dir / name)
-        trimmed = trim_event(raw, raw_sr)
-        if not _usable_clip(trimmed, raw_sr):
-            continue
-        crest, duration = clip_features(trimmed, raw_sr)
-        cand = _Candidate(
-            name=name,
-            trimmed=trimmed,
-            sr=raw_sr,
-            crest=crest,
-            duration=duration,
-            # Channel measures come from the untrimmed clip — trim_event removes the
-            # leading/trailing silence the noise floor is estimated from.
-            snr=snr_db(raw, raw_sr),
-            rate=envelope_rate_hz(trimmed, raw_sr),
-        )
-        (clipped if clipping_fraction(raw) > cfg.max_clipping else candidates).append(cand)
-
+    manifest = _manifest_for(cfg)
+    candidates = (
+        _candidates_from_manifest(manifest, pool, cfg) if manifest
+        else _candidates_from_audio(vs_dir, pool, rng, cfg)
+    )
     if not candidates:
-        # Every survivor was clipped: prefer a distorted clip over failing the row.
-        candidates = clipped
-    if not candidates:
-        raise RuntimeError(f"none of {len(names)} sampled '{vs_class}' clips were usable")
+        raise RuntimeError(f"no usable '{vs_class}' candidates (manifest={'yes' if manifest else 'no'})")
 
     crest_ranks = _percentile_ranks([c.crest for c in candidates])
     duration_ranks = _percentile_ranks([c.duration for c in candidates])
     intensities = [(c + d) / 2 for c, d in zip(crest_ranks, duration_ranks)]
 
+    # One draw per row, shared by every candidate — this is a target, not per-candidate noise.
+    aim = profile.energy_rank
+    if cfg.intensity_spread > 0:
+        aim = float(np.clip(rng.gauss(profile.energy_rank, cfg.intensity_spread), 0.0, 1.0))
+
     axis_weights = {
         "intensity": cfg.energy_weight,
         "clarity": cfg.clarity_weight,
         "tempo": cfg.tempo_weight,
+        "tilt": cfg.tilt_weight,
     }
     per_candidate = [
-        _axis_distances(cand, profile, intensity, vs_class)
+        _axis_distances(cand, profile, intensity, vs_class, intensity_target=aim)
         for cand, intensity in zip(candidates, intensities)
     ]
     sampling_weights = [
@@ -445,10 +635,15 @@ def pick_vocalsound_clip(
 
     idx = rng.choices(range(len(candidates)), weights=sampling_weights, k=1)[0]
     chosen = candidates[idx]
+
+    trimmed, sr = chosen.trimmed, chosen.sr
+    if trimmed is None:  # manifest path: only the winner is ever decoded
+        raw, sr = load_mono(vs_dir / chosen.name)
+        trimmed = trim_event(raw, sr)
     return ClipPick(
         name=chosen.name,
-        audio=_finalize_clip(chosen.trimmed, chosen.sr),
-        sr=chosen.sr,
+        audio=_finalize_clip(trimmed, sr),
+        sr=sr,
         intensity=intensities[idx],
         axes=per_candidate[idx],
     )

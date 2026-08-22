@@ -287,18 +287,172 @@ def splice_boundary_activity(speech, sr, at_s: float, win_ms: float = 50.0) -> t
     )
 
 
-def matched_room_tone(n: int, reference, amplitude_ratio: float = 0.05):
-    """A short low-level noise bridge whose amplitude tracks `reference`'s own RMS,
-    instead of true digital silence — a hard zero-silence gap between two segments that
-    both have real background noise reads as an artificial mute, especially on
-    headphones. `reference` should be a quiet-ish slice near the boundary, not a loud one."""
+def _loopable(ref: np.ndarray, xf: int) -> np.ndarray:
+    """`ref` rearranged so that tiling it end-to-end has no seam: its tail is crossfaded
+    onto its head, so the last sample of one repetition continues into the first sample of
+    the next. Returns a unit of length `len(ref) - xf`."""
+    fade = np.linspace(0.0, 1.0, xf, dtype=np.float32)
+    blended = ref[-xf:] * (1.0 - fade) + ref[:xf] * fade
+    return np.concatenate([blended, ref[xf:-xf]])
+
+
+def matched_room_tone(n: int, reference, amplitude_ratio: float = 1.0, rng=None):
+    """A bridge of the recording's *own* background, tiled to length `n`, instead of true
+    digital silence — a hard zero between two segments that both carry real background noise
+    reads as an artificial mute, especially on headphones.
+
+    Built from `reference`'s actual samples (pass `quietest_window()`'s output) rather than
+    from synthesized noise, which is what this used to do. Gaussian noise can be matched to
+    the floor's RMS but not to its *spectrum*, and real noise floors are strongly
+    low-frequency tilted — worse, a denoised or band-limited corpus has almost no HF floor at
+    all. Against either, a flat-white bridge is *more* audible than the silence it replaced:
+    it reads as a short puff of hiss appearing exactly where the edit is. Tiling the real
+    floor carries the true spectrum by construction, and needs no estimate of it.
+
+    `_loopable` removes the seam at the tile boundary, and `rng` picks the starting phase so
+    two gaps in the same recording aren't sample-identical. Pass a seeded `random.Random`
+    (the pipeline threads `Config.rng(row.id)`) to keep a run reproducible; the previous
+    implementation drew from numpy's *global* RNG, so `seed:` in the config never actually
+    reproduced the bridge.
+
+    Falls back to noise only when `reference` is too short to tile from.
+    """
     if n <= 0:
         return np.zeros(0, dtype=np.float32)
-    amp = max(rms(reference) * amplitude_ratio, 1e-5)
-    return np.random.normal(0, amp, n).astype(np.float32)
+    ref = np.asarray(reference, dtype=np.float32)
+    if len(ref) < 8:
+        amp = max(rms(ref) * amplitude_ratio, 1e-5)
+        draw = (rng.gauss if rng is not None else None)
+        if draw is None:
+            return np.random.normal(0, amp, n).astype(np.float32)
+        return np.array([draw(0.0, amp) for _ in range(n)], dtype=np.float32)
+
+    xf = max(len(ref) // 8, 1)
+    unit = _loopable(ref, xf)
+    tone = np.tile(unit, int(np.ceil(n / len(unit))) + 1)
+    start = rng.randrange(len(unit)) if rng is not None else 0
+    return (tone[start : start + n] * amplitude_ratio).astype(np.float32)
 
 
-def adaptive_splice(speech, insert, sr, gain_db, min_pad_ms, max_gap_ms, fade_ms, at_s):
+def existing_silence_s(speech, sr, at_s: float, top_db: float = 30.0,
+                       win_s: float = 0.010) -> tuple[float, float]:
+    """Seconds of already-silent audio immediately before and after `at_s`, as
+    (before_s, after_s) — what a splice at that point gets for free.
+
+    The gap `tempo_splice` inserts is a *target total*, not an addition, and this is the term
+    that makes it one. Without it the two are additive, which is a real over-padding on the
+    slot-constrained path: `slots.Slot.time_s` is by construction the midpoint of a VAD pause,
+    so each side already carries `pause_s/2 + vad.edge_margin_s` of silence, and adding a
+    full tempo gap on top puts the event inside up to ~0.9s of dead air where the speaker
+    left 0.15s. That reads as a hole in the recording no matter how clean the junctions are.
+
+    Measured here rather than read off `Slot.pause_s` on purpose: it also works on the paths
+    where there is no slot (a pre-tagged manifest, or `vad.on_no_pause: keep` leaving the cut
+    unsnapped), and it doesn't assume the VAD's pause midpoint is the *acoustic* midpoint —
+    in general the two sides are not equal.
+
+    Uses its own short-window envelope rather than `split_nonsilent`'s intervals, which was
+    the first implementation and measured badly: that detector frames at 2048 samples and
+    reports run edges padded by `frame_length // 2` (~46ms at 22.05kHz), so a cut 50ms inside
+    a genuine 600ms pause came back as 0ms of silence on both sides. A 10ms window resolves
+    the pause edge to within one frame. The threshold is the same `top_db`-below-peak rule
+    `split_nonsilent` uses, so "silent" still means the same thing across the module.
+
+    A cut in the middle of a voiced run returns (0, 0), and the full target gap is then
+    added — the pre-slot behaviour, unchanged.
+    """
+    x = np.asarray(speech, dtype=np.float32)
+    if len(x) == 0:
+        return 0.0, 0.0
+    win = max(int(win_s * sr), 1)
+    hop = max(win // 2, 1)
+    n_frames = 1 + max(len(x) - win, 0) // hop
+    idx = np.arange(win)[None, :] + hop * np.arange(n_frames)[:, None]
+    idx = np.minimum(idx, len(x) - 1)
+    env = np.sqrt(np.mean(x[idx].astype(np.float64) ** 2, axis=1))
+    ref = env.max()
+    if ref <= 0:
+        return 0.0, 0.0
+    quiet = env <= ref * (10 ** (-top_db / 20))
+
+    cut_f = int(np.clip(at_s * sr, 0, len(x) - 1)) // hop
+    cut_f = min(cut_f, n_frames - 1)
+    if not quiet[cut_f]:
+        return 0.0, 0.0
+
+    lo = cut_f
+    while lo > 0 and quiet[lo - 1]:
+        lo -= 1
+    hi = cut_f
+    while hi < n_frames - 1 and quiet[hi + 1]:
+        hi += 1
+    cut = int(np.clip(at_s * sr, 0, len(x)))
+    before = max(0.0, (cut - lo * hop) / sr)
+    after = max(0.0, ((hi + 1) * hop - cut) / sr)
+    return before, after
+
+
+def level_insert(insert, speech, sr, gain_db: float, level_ref: str = "context_rms",
+                 at_s: float | None = None, context_s: float = 2.5,
+                 offset_db: float = 0.0, peak_headroom: float = 1.5) -> np.ndarray:
+    """Scale the event to sit at the right level against the speech. Two references:
+
+    - `"peak"` — the original: the event's *peak* is placed `gain_db` below the speech's
+      peak over the whole utterance. The flaw is that a single plosive, mouth click or one
+      clipped sample anywhere in a 20-second take sets the event's level, and it ignores
+      where in the recording the event actually lands.
+    - `"context_rms"` (default) — the event's *RMS* is placed `gain_db + offset_db` relative
+      to the RMS of the `context_s` seconds of speech immediately before the cut. RMS-to-RMS
+      because peak-to-peak compares a sustained laugh against a transient consonant, and
+      local because a speaker's level varies across a take.
+
+      This also removes a real inconsistency: `selection.speaker_energy_score` already picks
+      the clip's *intensity* against a local `context_s` window, and the splice then levelled
+      it against the global peak — the two stages were referenced to different things.
+
+    `offset_db` is the per-class term (`vocalsound.LEVEL_OFFSET_DB`): a laugh genuinely sits
+    above conversational RMS and a sniff genuinely sits below, so "match the speech level"
+    is wrong for both in opposite directions.
+
+    The result is capped near the recording's own loud peaks (`peak_headroom` x its 99.9th
+    percentile) so the event can't run away with the file: `synthesize_row` peak-normalises
+    the finished waveform, so an over-hot event doesn't clip — it quietly ducks the entire
+    recording around itself. Headroom above 1.0 because a laugh is a high-crest sound and
+    legitimately peaks above conversational speech; the cap is a runaway guard, not a target.
+    """
+    ins = np.asarray(insert, dtype=np.float32).copy()
+    peak = float(np.max(np.abs(ins)))
+    if peak <= 0:
+        return ins
+
+    if level_ref == "peak":
+        tgt = float(np.max(np.abs(speech))) * (10 ** (gain_db / 20))
+        return ins / (peak + 1e-9) * tgt
+    if level_ref != "context_rms":
+        raise ValueError(f"level_ref must be 'peak' or 'context_rms', got {level_ref!r}")
+
+    end = len(speech) if at_s is None else int(np.clip(at_s * sr, 0, len(speech)))
+    start = max(0, end - max(int(context_s * sr), 1))
+    ref_rms = rms(speech[start:end]) or rms(speech)
+    if ref_rms <= 0:
+        return ins
+
+    target_rms = ref_rms * (10 ** ((gain_db + offset_db) / 20))
+    ins = ins * (target_rms / (rms(ins) + 1e-12))
+
+    # Capped against a robust peak, not `max(|speech|)`. The whole point of this branch is
+    # not to let one stray click set the event's level, and a cap read off the true maximum
+    # smuggles exactly that back in through the other door — measured on a synthetic take, a
+    # single 0.99 sample moved the event 8.4 dB by loosening the cap alone. The 99.9th
+    # percentile tracks the recording's real loud peaks and ignores lone samples.
+    cap = float(np.percentile(np.abs(speech), 99.9)) * peak_headroom
+    hot = float(np.max(np.abs(ins)))
+    if cap > 0 and hot > cap:
+        ins = ins * (cap / hot)
+    return ins
+
+
+def adaptive_splice(speech, insert, sr, gain_db, min_pad_ms, max_gap_ms, fade_ms, at_s, rng=None):
     """Two-junction splice (speech[:cut] -> insert -> speech[cut:]) that inspects each
     junction's boundary RMS before deciding what to do with it, instead of always paying a
     fixed fade+pad cost regardless of where the cut actually fell:
@@ -326,6 +480,7 @@ def adaptive_splice(speech, insert, sr, gain_db, min_pad_ms, max_gap_ms, fade_ms
     tgt = np.max(np.abs(speech)) * (10 ** (gain_db / 20))
     ins = ins / (np.max(np.abs(ins)) + 1e-9) * tgt
 
+    floor = quietest_window(speech, sr)
     rms_before = rms(speech_before)
     rms_after = rms(speech_after)
     rms_ins = rms(ins)
@@ -336,7 +491,10 @@ def adaptive_splice(speech, insert, sr, gain_db, min_pad_ms, max_gap_ms, fade_ms
         speech_before = cosine_fade_out(speech_before, fade_len)
     if boundary_is_active(ins[:fade_len], rms_ins):
         ins = cosine_fade_in(ins, fade_len)
-    gap1 = matched_room_tone(max_gap if before_active else min_pad, speech_before[-fade_len:])
+    # The bridge is built from the recording's own noise floor, not from the samples at
+    # the boundary: `matched_room_tone` now tiles real audio, and the audio at a boundary
+    # is speech, which tiled at any level is an audible ghost of the interrupted word.
+    gap1 = matched_room_tone(max_gap if before_active else min_pad, floor, rng=rng)
 
     # Junction 2: end of insert <-> start of speech_after
     ins_tail_active = boundary_is_active(ins[-fade_len:], rms_ins)
@@ -344,16 +502,19 @@ def adaptive_splice(speech, insert, sr, gain_db, min_pad_ms, max_gap_ms, fade_ms
         ins = cosine_fade_out(ins, fade_len)
     if boundary_is_active(speech_after[:fade_len], rms_after):
         speech_after = cosine_fade_in(speech_after, fade_len)
-    gap2 = matched_room_tone(max_gap if ins_tail_active else min_pad, ins[-fade_len:])
+    gap2 = matched_room_tone(max_gap if ins_tail_active else min_pad, floor, rng=rng)
 
     out = np.concatenate([speech_before, gap1, ins, gap2, speech_after])
     return out, cut / sr
 
 
 def tempo_splice(speech, insert, sr, gain_db, fade_ms, at_s, gap_scale: float = 1.0,
-                 fade_k: float = 5.0):
+                 fade_k: float = 5.0, pre_scale: float = 1.0, post_scale: float = 1.0,
+                 level_ref: str = "context_rms", context_s: float = 2.5,
+                 level_offset_db: float = 0.0, rng=None):
     """Two-junction splice that damps both cuts with a short exponential fade and separates
-    them with a room-tone gap sized to *this speaker's own* pause tempo.
+    them by a *total* silence sized to this speaker's own pause tempo and shaped by the
+    event's respiratory profile.
 
     Motivated by a measured failure of `splice()` on real output: the forced-aligned cut
     landed mid-phonation on 20/20 rows of the first batch, and `splice()` concatenates the
@@ -362,7 +523,7 @@ def tempo_splice(speech, insert, sr, gain_db, fade_ms, at_s, gap_scale: float = 
     ~140ms of leading/trailing silence, so that fade was spent entirely on silence while the
     event itself still began at full amplitude.
 
-    The three fixes, all of which need each other:
+    The pieces, all of which need each other:
 
     1. **Trimmed insert** — the caller passes an insert whose dead air has been trimmed
        (see `trim_event`), so the fade lands on the actual event rather than on padding and
@@ -370,13 +531,29 @@ def tempo_splice(speech, insert, sr, gain_db, fade_ms, at_s, gap_scale: float = 
     2. **Exponential fades at both junctions** — the interrupted speech is faded out and the
        event faded in (and symmetrically at the resume, since cutting mid-word means the
        resumed speech also starts mid-word). Exponential rather than cosine: it damps fast
-       and preserves the event's attack — see `exponential_fade_out`/`_in`.
-    3. **Tempo-matched gap** — `speech_pause_s` measures the speaker's median pause and the
-       gap matches it, so the event sits in a silence the recording's own rhythm predicts
-       instead of the fixed 10ms `pad_ms`, which is shorter than any real pause.
+       and preserves the event's attack — see `exponential_fade_out`/`_in`. Applied
+       unconditionally; where the cut already fell in silence the fade is inaudible, so the
+       conditional `adaptive_splice` uses only buys a way to be wrong.
+    3. **A tempo-matched, respiration-shaped, budgeted gap** — three separate ideas:
 
-    The gap is `matched_room_tone`, not digital silence, for the reason documented there: a
-    hard zero between two segments that both carry real background noise reads as a mute.
+       *Tempo*: `speech_pause_s` measures the speaker's median pause and that is the base, so
+       the event sits in a silence the recording's own rhythm predicts instead of the fixed
+       10ms `pad_ms`, which is shorter than any real pause.
+
+       *Shape*: `pre_scale`/`post_scale` (from `vocalsound.GAP_SHAPE`) make the two sides
+       asymmetric, because the respiratory state an event *ends* in is not the one it starts
+       in. A laugh ends on depleted lungs and needs a long trailing beat plus an intake
+       before speech resumes; a sniff ends ready to speak and needs almost none. A single
+       symmetric gap gets at most one of the two sides right.
+
+       *Budget*: the scaled targets are a total, and `existing_silence_s` measures what each
+       side already has, so only the shortfall is inserted. Without this the gap is purely
+       additive, which over-pads the slot-constrained path badly — see `existing_silence_s`.
+       The shortfall is clamped at zero: silence already in the recording is the speaker's
+       own audio, and this pipeline does not shorten that.
+
+    Both bridges are `matched_room_tone`, not digital silence, for the reason documented
+    there. `rng` seeds them; pass `Config.rng(row.id)` to keep a run reproducible.
 
     Same return contract as `splice()`: (waveform, cut_time_s).
     """
@@ -387,22 +564,22 @@ def tempo_splice(speech, insert, sr, gain_db, fade_ms, at_s, gap_scale: float = 
     cut = max(0, min(int(at_s * sr), len(speech)))
     speech_before, speech_after = speech[:cut], speech[cut:]
 
-    ins = insert.copy()
-    tgt = np.max(np.abs(speech)) * (10 ** (gain_db / 20))
-    ins = ins / (np.max(np.abs(ins)) + 1e-9) * tgt
+    ins = level_insert(insert, speech, sr, gain_db, level_ref=level_ref, at_s=at_s,
+                       context_s=context_s, offset_db=level_offset_db)
 
-    # Both junctions get damped unconditionally: unlike adaptive_splice, this mode doesn't
-    # test whether the boundary is active, because in practice it always is — and a fade
-    # across an already-quiet boundary is inaudible anyway, so the test only bought risk.
     speech_before = exponential_fade_out(speech_before, fade_len, fade_k)
     ins = exponential_fade_in(ins, fade_len, fade_k)
     ins = exponential_fade_out(ins, fade_len, fade_k)
     speech_after = exponential_fade_in(speech_after, fade_len, fade_k)
 
+    base = speech_pause_s(speech, sr) * gap_scale
+    have_pre, have_post = existing_silence_s(speech, sr, at_s)
+    gap_pre_n = max(0, int((base * pre_scale - have_pre) * sr))
+    gap_post_n = max(0, int((base * post_scale - have_post) * sr))
+
     floor = quietest_window(speech, sr)
-    gap_n = int(speech_pause_s(speech, sr) * gap_scale * sr)
-    gap1 = matched_room_tone(gap_n, floor, amplitude_ratio=1.0)
-    gap2 = matched_room_tone(gap_n, floor, amplitude_ratio=1.0)
+    gap1 = matched_room_tone(gap_pre_n, floor, amplitude_ratio=1.0, rng=rng)
+    gap2 = matched_room_tone(gap_post_n, floor, amplitude_ratio=1.0, rng=rng)
 
     out = np.concatenate([speech_before, gap1, ins, gap2, speech_after])
     return out, cut / sr

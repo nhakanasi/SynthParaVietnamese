@@ -46,11 +46,42 @@ class SpliceConfig:
     # speaker's own tempo). fade_k is the exponential fade's curvature — higher damps faster.
     gap_scale: float = 1.0
     fade_k: float = 5.0
+    # tempo only. The gap is a *budget*, not an addition: `audio_utils.existing_silence_s`
+    # measures the silence each side of the cut already has and only the shortfall is
+    # inserted. Without this the tempo gap stacks on top of the pause the slot path
+    # deliberately cut into, which over-pads badly — see that function's docstring.
+    # `gap_shape` overrides vocalsound.GAP_SHAPE per class as {class: [pre, post]}, the
+    # asymmetric pre/post multipliers on the speaker's measured median pause.
+    gap_shape: dict = field(default_factory=dict)
+    # How the event's level is referenced to the speech (see audio_utils.level_insert):
+    #   "context_rms" — event RMS vs. the RMS of the `selection.context_s` seconds before
+    #                   the cut, plus the per-class term below. The default.
+    #   "peak"        — the original: event peak `para_gain_db` under the utterance's peak.
+    level_ref: str = "context_rms"
+    # The gain that goes with level_ref: "context_rms". Kept separate from `para_gain_db`
+    # rather than reusing it, because the two are not the same quantity — one is dB against
+    # the local speech RMS, the other dB under the whole utterance's peak — and a single
+    # field meaning either depending on a neighbouring field is a trap. 0.0 means "the event
+    # sits at the speaker's local speech RMS", with vocalsound.LEVEL_OFFSET_DB then moving
+    # each class off that baseline in the direction its physics implies.
+    context_gain_db: float = 0.0
+    # Overrides vocalsound.LEVEL_OFFSET_DB per class, {class: dB}. Only used by
+    # level_ref: "context_rms" — a laugh sits above conversational RMS and a sniff below,
+    # so a single target level is wrong for both in opposite directions.
+    level_offsets_db: dict = field(default_factory=dict)
 
     def __post_init__(self):
         valid = {"tempo", "adaptive", "fixed"}
         if self.mode not in valid:
             raise ValueError(f"splice.mode must be one of {sorted(valid)}, got {self.mode!r}")
+        if self.level_ref not in {"context_rms", "peak"}:
+            raise ValueError(
+                f"splice.level_ref must be 'context_rms' or 'peak', got {self.level_ref!r}"
+            )
+
+    def gain_db(self) -> float:
+        """The gain field that belongs to the configured `level_ref`."""
+        return self.context_gain_db if self.level_ref == "context_rms" else self.para_gain_db
 
 
 @dataclass
@@ -80,6 +111,15 @@ class SelectionConfig:
     # (laughter) — cough/sneeze/throat-clearing/sniff are reflexes with no link to
     # speaking rate. Ignored for every other class regardless of this value.
     tempo_weight: float = 0.0
+    # Trend: how much the event's loudness rises or falls across its own span, in dB,
+    # against the same measure on the speech running into the splice point. Independent of
+    # tempo_weight (rate says how often the envelope peaks, this says which way it is
+    # going), and it is the selection-side answer to "let the event decay into the trailing
+    # pause" — pick a clip that already decays instead of DSP-shaping one that doesn't.
+    # UNCALIBRATED: selection.TILT_TOLERANCE_DB is a prior, not a measurement from this
+    # corpus. Keep this modest until scripts/measure_selection_axes.py has reported the
+    # tilt_db spread on both corpora.
+    tilt_weight: float = 0.0
     # Seconds of speech immediately before the splice point used as the speaker's
     # reference level and pace — local context, not the whole utterance, since a speaker's
     # energy varies across a recording and what matters is the moment the event interrupts.
@@ -95,6 +135,23 @@ class SelectionConfig:
     # bandwidth there's no target recording it can be "close to". Dropped rather than
     # allowed to empty the pool, so it can never fail a row on its own.
     max_clipping: float = 0.01
+    # Standard deviation of the per-row intensity *target*, in percentile-rank units.
+    # 0.0 aims every row at the speaker's own energy rank, which assumes a person's laugh
+    # scales with how loudly they were speaking; a quiet, slow speaker with a loud laugh is
+    # a real and common person that assumption cannot produce except through the sampling
+    # weight's tail. Above zero, the target is drawn per row around the speaker's rank, so
+    # the correlation survives on average while genuine mismatches occur at a rate that was
+    # chosen. This is NOT the same as lowering energy_weight, which only makes the axis
+    # sloppy in both directions. ~0.2 keeps most rows within a fifth of the speaker's rank.
+    intensity_spread: float = 0.0
+    # Optional path to a precomputed per-clip feature manifest
+    # (scripts/build_clip_features.py). When present, the candidate set is the *whole* class
+    # rather than `candidate_pool` random decodes, only the winning clip is decoded, and the
+    # intensity percentile ranks become corpus-wide instead of draw-wide. `candidate_pool`
+    # is then unused. It is a cache, not a commitment: it stores raw measurements only, so
+    # re-weighting or re-scaling any axis needs no rebuild — only changing an extractor
+    # does, which selection.FEATURE_VERSION detects and warns about.
+    feature_manifest: Optional[str] = None
 
 
 @dataclass
@@ -306,6 +363,16 @@ def _quality_config(raw: dict) -> QualityConfig:
     return QualityConfig(nisqa=NisqaConfig(**raw.pop("nisqa", {})), **raw)
 
 
+def _selection_config(raw: dict, root: Path) -> SelectionConfig:
+    """`feature_manifest` is the one selection field that names a file, so it gets the same
+    repo-root-relative treatment every path in `paths:` does."""
+    raw = dict(raw)
+    manifest = raw.get("feature_manifest")
+    if manifest:
+        raw["feature_manifest"] = str(_resolve(root, manifest))
+    return SelectionConfig(**raw)
+
+
 def _resolve(root: Path, value: str) -> Path:
     p = Path(value)
     return p if p.is_absolute() else (root / p)
@@ -327,7 +394,7 @@ def load_config(path: str | Path = REPO_ROOT / "configs/default.yaml") -> Config
             f0_condition=raw["seedvc"]["f0_condition"],
         ),
         splice=SpliceConfig(**raw["splice"]),
-        selection=SelectionConfig(**raw.get("selection", {})),
+        selection=_selection_config(raw.get("selection", {}), root),
         alignment=AlignmentConfig(use_qwen3=raw["alignment"].get("use_qwen3", True)),
         vad=VADConfig(**(raw.get("vad") or {})),
         models=ModelsConfig(

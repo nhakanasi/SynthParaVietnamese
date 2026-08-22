@@ -35,6 +35,7 @@ from para_synth.config import load_config  # noqa: E402
 from para_synth.selection import (  # noqa: E402
     clip_features,
     envelope_rate_hz,
+    envelope_tilt_db,
     snr_db,
 )
 
@@ -84,7 +85,7 @@ def spread(cfg, n_clips: int, seed: int) -> None:
     print(f"VocalSound clips available: {len(names)}")
     rng = random.Random(seed)
     per_axis: dict[str, list[float]] = {"snr_db": [], "rate_hz": [], "crest": [],
-                                        "duration_s": [], "f0_hz": []}
+                                        "duration_s": [], "tilt_db": [], "f0_hz": []}
     for name in rng.sample(names, min(n_clips, len(names))):
         raw, sr = load_mono(vs_dir / name)
         trimmed = trim_event(raw, sr)
@@ -93,22 +94,28 @@ def spread(cfg, n_clips: int, seed: int) -> None:
         crest, duration = clip_features(trimmed, sr)
         per_axis["snr_db"].append(snr_db(raw, sr))  # untrimmed: trim removes the noise floor
         per_axis["rate_hz"].append(envelope_rate_hz(trimmed, sr))
+        # tilt_db is the one axis whose tolerance (selection.TILT_TOLERANCE_DB) is still a
+        # prior rather than a measurement — set it from this p10/p90 before raising
+        # selection.tilt_weight above 0.
+        per_axis["tilt_db"].append(envelope_tilt_db(trimmed, sr))
         per_axis["crest"].append(crest)
         per_axis["duration_s"].append(duration)
         per_axis["f0_hz"].append(_median_f0(trimmed, sr))
     print("clips:")
     for axis, values in per_axis.items():
-        _quantiles(axis, values, "8.2f" if axis in ("crest", "rate_hz", "duration_s") else "8.1f")
+        _quantiles(axis, values,
+                   "8.2f" if axis in ("crest", "rate_hz", "duration_s") else "8.1f")
 
     speech_files = sorted(cfg.paths.raw_audio_dir.glob("*.wav"))
     if not speech_files:
         print("speech: (no recordings in paths.raw_audio_dir)")
         return
-    speech: dict[str, list[float]] = {"snr_db": [], "rate_hz": [], "f0_hz": []}
+    speech: dict[str, list[float]] = {"snr_db": [], "rate_hz": [], "tilt_db": [], "f0_hz": []}
     for path in speech_files:
         wav, sr = load_mono(path, cfg.sample_rate)
         speech["snr_db"].append(snr_db(wav, sr))
         speech["rate_hz"].append(envelope_rate_hz(wav, sr))
+        speech["tilt_db"].append(envelope_tilt_db(wav, sr))
         speech["f0_hz"].append(_median_f0(wav, sr))
     print("speech:")
     for axis, values in speech.items():

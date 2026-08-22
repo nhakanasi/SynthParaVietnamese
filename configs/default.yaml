@@ -30,6 +30,43 @@ splice:
   max_gap_ms: 70 # adaptive only: bridge width at a boundary that needed damping
   gap_scale: 1.0 # tempo only: multiplier on the measured median pause (1.0 = exact tempo)
   fade_k: 5.0 # tempo only: exponential fade curvature — higher damps faster
+  # tempo only. The gap is a BUDGET, not an addition: audio_utils.existing_silence_s()
+  # measures the silence each side of the cut already has, and only the shortfall is
+  # inserted. This matters most on the slot-constrained path, where slots.Slot.time_s is by
+  # construction the midpoint of a VAD pause — so each side already carries pause_s/2 +
+  # vad.edge_margin_s, and a purely additive gap put the event inside up to ~0.9s of dead
+  # air where the speaker left 0.15s. Clamped at zero: silence already in the recording is
+  # the speaker's own audio and is never shortened.
+  #
+  # The pre/post multipliers on the speaker's median pause come from vocalsound.GAP_SHAPE,
+  # which is asymmetric per class because the respiratory state an event ENDS in is not the
+  # one it starts in — a laugh ends on depleted lungs and needs a trailing beat plus an
+  # intake before speech resumes; a sniff ends ready to phonate. Uncomment to override:
+  # gap_shape:
+  #   laughter: [0.6, 1.4]
+  #   sniff: [0.5, 0.7]
+  #
+  # How the event's level is referenced to the speech (audio_utils.level_insert):
+  #   context_rms — event RMS against the RMS of the selection.context_s seconds of speech
+  #                 before the cut, plus vocalsound.LEVEL_OFFSET_DB for the class. Default.
+  #                 Local and RMS-to-RMS because a single plosive anywhere in a 20s take set
+  #                 the event's level under "peak", and because selection already matches
+  #                 clip intensity against this same local window — the two stages were
+  #                 referenced to different things.
+  #   peak        — the original: event peak para_gain_db below the utterance's peak.
+  level_ref: context_rms
+  # The gain that goes with level_ref: context_rms — dB against the speaker's local speech
+  # RMS. Separate from para_gain_db above (dB under the utterance's PEAK, used by level_ref:
+  # peak and by the fixed/adaptive modes) because they are not the same quantity, and one
+  # field meaning either depending on a neighbour is a trap. 0.0 = the event sits at the
+  # speaker's local speech RMS, with the per-class offsets moving it from there.
+  context_gain_db: 0.0
+  # Overrides vocalsound.LEVEL_OFFSET_DB per class, in dB against local speech RMS. A laugh
+  # genuinely sits above conversational level and a sniff below; one target is wrong for
+  # both in opposite directions. Uncomment to override:
+  # level_offsets_db:
+  #   laughter: 3.0
+  #   sniff: -5.0
 
 selection:
   # How pick_vocalsound_clip() (para_synth/selection.py) chooses a clip within the matched
@@ -49,9 +86,40 @@ selection:
   # throat-clearing/sniff are reflexes whose rate has no link to speaking rate, so this is
   # ignored for them whatever it's set to. Note this selects a clip that already fits; it
   # does not time-stretch one that doesn't (see "Deliberately not implemented").
+  tilt_weight: 0.0 # trend: dB the event's loudness rises/falls across its own span, vs the
+  # same measure on the speech running into the splice. Independent of tempo_weight (rate =
+  # how often the envelope peaks, tilt = which way it's going), and it is the selection-side
+  # answer to "let the event decay into the trailing pause" — pick a clip that already
+  # decays rather than DSP-shaping one that doesn't.
+  # OFF BY DEFAULT AND DELIBERATELY SO: selection.TILT_TOLERANCE_DB is a prior, not a
+  # measurement from this corpus, unlike the SNR and tempo tolerances. Run
+  # scripts/measure_selection_axes.py, read the tilt_db p10/p90 for both corpora, set the
+  # tolerance from it, then raise this to ~0.5-1.0. Turning it on before that spends weight
+  # on an axis whose distance scale is guessed.
   context_s: 2.5 # seconds of speech before the splice point used as the energy/pace reference
-  candidate_pool: 48 # clips loaded and measured per row when any weight is on
+  candidate_pool: 48 # clips loaded and measured per row when any weight is on. IGNORED when
+  # feature_manifest is set — the candidate set is then the whole class.
   max_clipping: 0.01 # hard gate (not a match): drop candidates this clipped
+  # Spread of the per-row intensity TARGET, in percentile-rank units. 0.0 aims every row at
+  # the speaker's own energy rank, which structurally assumes a person's laugh scales with
+  # how loudly they were speaking — a quiet, slow speaker with a loud laugh is a real and
+  # common person that a point target can only produce through the sampling weight's tail.
+  # Above zero the target is drawn per row around the speaker's rank, so the correlation
+  # survives on average while genuine mismatches happen at a rate that was chosen rather
+  # than fell out of a weight. NOT the same as lowering energy_weight, which just makes the
+  # axis sloppy in both directions instead of aiming it somewhere honest.
+  # 0.2 keeps most rows within a fifth of the speaker's rank; raise it for a corpus you
+  # want deliberately more varied.
+  intensity_spread: 0.2
+  # Precomputed per-clip features (scripts/build_clip_features.py). With it, the candidate
+  # set is the whole class instead of candidate_pool random decodes, only the winning clip
+  # is decoded, and the intensity ranks are corpus-wide instead of draw-wide (ranked inside
+  # 48 resampled clips, the same clip scores differently on different rows and the extremes
+  # saturate). It is a cache, not a commitment: raw measurements only, so re-weighting or
+  # re-scaling any axis needs no rebuild — only changing an extractor does, and
+  # selection.FEATURE_VERSION turns a stale manifest into a warning + fallback, never a
+  # silently wrong run. null = measure a sampled pool per row, as before.
+  feature_manifest: null # e.g. data/vocalsound/clip_features.json
 
 sample_rate: 22050 # Seed-VC's base vocoder rate; everything is resampled to this
 
